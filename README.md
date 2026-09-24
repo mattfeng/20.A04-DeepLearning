@@ -53,6 +53,31 @@
     ```
 - Activate the environment:
     ```bash
+    mamba activate 20.A04
+    ```
+- Install the dependencies:
+    ```bash
+    pip install jax einops numpy trackio
+    ```
+- Run the training script:
+    ```bash
+    python train.py
+    ```
+- In another terminal, activate the environment and then start the [Trackio](https://github.com/gradio-app/trackio) viewer:
+    ```bash
+    mamba activate 20.A04
+    trackio show
+    ```
+- Now, you can play with different hyperparameters of the model and see how it affects performance:
+    ```bash
+    # show available options
+    python train.py --help
+
+    # change number of epochs
+    python train.py --epochs 20
+
+    # change hidden size; you are training on CPU, so this number can't be too high
+    python train.py --hidden-size 32
     ```
 
 ## Attention and transformers

@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import trackio
+from tqdm.auto import tqdm
 
 
 # --------------------------------------------------
@@ -151,7 +152,11 @@ for epoch in range(args.epochs):
     indices = rng.permutation(len(train_images))
     epoch_loss = 0.0
 
-    for start in range(0, len(indices), args.batch_size):
+    for start in tqdm(
+        range(0, len(indices), args.batch_size),
+        desc=f"Epoch {epoch + 1}/{args.epochs}",
+        unit="batch",
+    ):
         batch = indices[start:start + args.batch_size]
 
         params, batch_loss = train_step(
