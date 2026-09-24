@@ -22,10 +22,11 @@
 3. Cost/loss functions
     - Because we are learning a function to map from inputs to outputs, we need a way to inform the network how well or poorly it is performing. This is the purpose of the **cost/loss function**.
     - Typical loss functions used are:
-        - Mean squared error (MSE):
-        - Cross-entropy: categorical classification
+        - Mean squared error (MSE): continuous regression
+        - Cross-entropy/negative log-likelihood: mutually-exclusive multiclass classification
 4. Gradient descent
-    - Stochastic gradient descent
+    - Stochastic gradient descent (SGD): a compute-efficient version of gradient that only uses a **minibatch** (subset) of training data to compute the gradient.
+        - A side effect of SGD is that it helps escape local minima because of its randomness
 5. Backpropagation
     - An efficient algorithm for computing gradients
 
