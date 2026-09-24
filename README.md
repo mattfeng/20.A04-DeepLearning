@@ -79,10 +79,13 @@
     # change hidden size; you are training on CPU, so this number can't be too high
     python train.py --hidden-size 32
     ```
+- You can also visualize the dataset:
+    ```bash
+    python visualize_data.py --split train --index 0 --count 10
+    ```
 
 ## Attention and transformers
 
 - 3Blue1Brown
     - DL5 — Transformers: https://www.youtube.com/watch?v=wjZofJX0v4M
     - DL6 — Attention in transformers: https://www.youtube.com/watch?v=eMlx5fFNoYc
-
