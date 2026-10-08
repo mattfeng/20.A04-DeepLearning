@@ -48,13 +48,13 @@
     ```bash
     "${SHELL}" <(curl -L micro.mamba.pm)
     ```
-- Create a `conda`/`mamba` (use the one you have installed) environment for 20.A04:
+- Create a `conda`/`mamba`/`micromamba` (use the one you have installed) environment for 20.A04:
     ```bash
-    mamba create -n 20.A04 python=3.12
+    micromamba create -n 20.A04 python=3.12
     ```
 - Activate the environment:
     ```bash
-    mamba activate 20.A04
+    micromamba activate 20.A04
     ```
 - Install the dependencies:
     ```bash
@@ -66,7 +66,7 @@
     ```
 - In another terminal, activate the environment and then start the [Trackio](https://github.com/gradio-app/trackio) viewer:
     ```bash
-    mamba activate 20.A04
+    micromamba activate 20.A04
     trackio show
     ```
 - Now, you can play with different hyperparameters of the model and see how it affects performance:
