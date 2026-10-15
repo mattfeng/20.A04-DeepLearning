@@ -23,7 +23,8 @@ parser.add_argument("--batch-size", type=int, default=100)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--channels", type=int, nargs=2, default=[8, 16],
                     help="output channels in the two convolutional layers")
-parser.add_argument("--kernel-size", type=int, default=3)
+parser.add_argument("--kernel-size", type=int, nargs=2, default=[3, 3],
+                    help="kernel sizes in the two convolutional layers (e.g. 5 3)")
 parser.add_argument("--hidden-size", type=int, default=16)
 parser.add_argument("--seed", type=int, default=0)
 
@@ -43,12 +44,13 @@ class CNN(eqx.Module):
 
     def __init__(self, key, channels, kernel_size, hidden_size):
         c1, c2 = channels
+        k1, k2 = kernel_size
         keys = jax.random.split(key, 4)
         self.conv1 = eqx.nn.Conv2d(
-            1, c1, kernel_size, padding="SAME", key=keys[0]
+            1, c1, k1, padding="SAME", key=keys[0]
         )
         self.conv2 = eqx.nn.Conv2d(
-            c1, c2, kernel_size, padding="SAME", key=keys[1]
+            c1, c2, k2, padding="SAME", key=keys[1]
         )
         self.pool = eqx.nn.MaxPool2d(kernel_size=2, stride=2)
         self.hidden = eqx.nn.Linear(7 * 7 * c2, hidden_size, key=keys[2])

@@ -30,11 +30,12 @@
 5. Backpropagation
     - An efficient algorithm for computing gradients
 
-## Multilayer perceptrons (MLPs)
+## Feedforward networks
 
 - References
     - https://www.3blue1brown.com/lessons/neural-networks
     - https://www.3blue1brown.com/lessons/neural-network-analysis/
+- Feedforward networks are also called **multilayer perceptrons (MLPs)**.
 - Train, validation, and test sets
   - MNIST
     - Training set: 60,000 images
