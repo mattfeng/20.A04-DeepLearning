@@ -30,7 +30,7 @@
 5. Backpropagation
     - An efficient algorithm for computing gradients
 
-## MNIST in JAX
+## Multilayer perceptrons (MLPs)
 
 - References
     - https://www.3blue1brown.com/lessons/neural-networks
@@ -58,7 +58,7 @@
     ```
 - Install the dependencies:
     ```bash
-    pip install jax einops numpy trackio
+    pip install jax equinox einops numpy optax trackio tqdm
     ```
 - Run the training script:
     ```bash
@@ -84,6 +84,32 @@
     ```bash
     python visualize_data.py --split train --index 0 --count 10
     ```
+
+## Convolutional neural networks (CNNs)
+
+`mnist/train_cnn.py` follows the same five-section structure as `train.py`.
+
+Its `CNN(eqx.Module)` uses Equinox `Conv2d`, `MaxPool2d`, and `Linear` layers: two SAME-padded convolutions with ReLU and 2×2 max pooling, followed by a ReLU dense layer and ten raw class logits.
+
+Metrics are logged to the `mnist-cnn` Trackio project.
+
+```bash
+python train_cnn.py --help
+python train_cnn.py --channels 8 16 --kernel-size 3 --hidden-size 16 \
+    --learning-rate 1.0 --batch-size 100 --epochs 10 --seed 0
+```
+
+The values above are the defaults. `--channels` takes the output channel count for each convolution; `--kernel-size` controls both square kernels; `--hidden-size` controls the dense hidden layer.
+
+### References
+
+- CNNs
+    - How blurs and filters work (Computerphile): https://www.youtube.com/watch?v=C_zFhWdM4ic
+    - Sobel edge operator (Computerphile): https://www.youtube.com/watch?v=uihBwtPIBxM
+    - Convolutional neural networks (Computerphile): https://www.youtube.com/watch?v=py5byOOHZM8
+- Categorical cross-entropy
+    - Entropy (3Blue1Brown): https://www.youtube.com/watch?v=l6DKRf-fAAM
+    - Cross-entropy (understanding categorical cross-entropy loss; 3Blue1Brown): https://www.youtube.com/watch?v=GlYgs6v2YfU
 
 ## Attention and transformers
 

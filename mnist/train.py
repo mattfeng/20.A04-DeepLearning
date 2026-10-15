@@ -7,6 +7,7 @@ import einops
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import trackio
 from tqdm.auto import tqdm
 
@@ -55,36 +56,37 @@ def predict(params, images):
         images, "batch height width -> batch (height width)"
     )
 
-    for weights, bias in params:
+    for weights, bias in params[:-1]:
         x = sigmoid(x @ weights + bias)
 
-    return x
+    weights, bias = params[-1]
+    return x @ weights + bias  # Raw class logits.
 
 
 # --------------------------------------------------
 # 3. Loss and training
 # --------------------------------------------------
 
-def loss(params, images, labels):
-    targets = jnp.eye(10)[labels]
-    outputs = predict(params, images)
+optimizer = optax.sgd(args.learning_rate)
 
-    return jnp.mean(jnp.sum((outputs - targets) ** 2, axis=-1))
+
+def loss(params, images, labels):
+    logits = predict(params, images)
+    return jnp.mean(
+        optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    )
 
 
 @jax.jit
-def train_step(params, images, labels, learning_rate):
+def train_step(params, opt_state, images, labels):
     value, gradients = jax.value_and_grad(loss)(
         params, images, labels
     )
 
-    params = jax.tree.map(
-        lambda p, g: p - learning_rate * g,
-        params,
-        gradients,
-    )
+    updates, opt_state = optimizer.update(gradients, opt_state, params)
+    params = optax.apply_updates(params, updates)
 
-    return params, value
+    return params, opt_state, value
 
 
 @jax.jit
@@ -140,6 +142,7 @@ train_images = train_images[:-5000]
 train_labels = train_labels[:-5000]
 
 params = init(jax.random.key(args.seed), args.hidden_size)
+opt_state = optimizer.init(params)
 rng = np.random.default_rng(args.seed)
 
 # Trackio stores the configuration and metrics locally.
@@ -159,11 +162,11 @@ for epoch in range(args.epochs):
     ):
         batch = indices[start:start + args.batch_size]
 
-        params, batch_loss = train_step(
+        params, opt_state, batch_loss = train_step(
             params,
+            opt_state,
             train_images[batch],
             train_labels[batch],
-            args.learning_rate,
         )
 
         epoch_loss += batch_loss * len(batch)
