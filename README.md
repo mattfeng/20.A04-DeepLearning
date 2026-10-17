@@ -1,17 +1,23 @@
 # 20.A04-DeepLearning
 
+## Shared Python environment
+
+The root `pyproject.toml` declares dependencies for both MNIST and arithmetic
+experiments. From the repository root:
+
+```bash
+uv sync
+uv run mnist/train.py
+uv run math/experiment.py
+```
+
+See [arithmetic experiments](math/README.md) for task configuration and metrics.
+
 ## Math foundations
 - [3Blue1Brown's Linear Algebra series](https://www.youtube.com/playlist?list=PLZHQObOWTQDPD3MizzM2xVFitgF8hE_ab)
     - Focus on chapters 3, 4, and 5
 
 ## Neural networks, cost functions, gradient descent, and backpropagation
-
-### References
-- https://www.3blue1brown.com/lessons/neural-networks
-- https://www.3blue1brown.com/lessons/gradient-descent
-- https://www.3blue1brown.com/lessons/neural-network-analysis/
-- https://www.3blue1brown.com/lessons/backpropagation/
-- https://www.3blue1brown.com/lessons/backpropagation-calculus/
 
 ### Notes
 
@@ -22,17 +28,51 @@
 3. Cost/loss functions
     - Because we are learning a function to map from inputs to outputs, we need a way to inform the network how well or poorly it is performing. This is the purpose of the **cost/loss function**.
     - Typical loss functions used are:
-        - Mean squared error (MSE): continuous regression
-        - Cross-entropy/negative log-likelihood: mutually-exclusive multiclass classification
+        - **Mean squared error (MSE)**, for continuous regression
+        - **Categorical cross-entropy**/negative log-likelihood, for mutually-exclusive multiclass classification
+            - Entropy (3Blue1Brown): https://www.youtube.com/watch?v=l6DKRf-fAAM
+            - Cross-entropy (understanding categorical cross-entropy loss; 3Blue1Brown): https://www.youtube.com/watch?v=GlYgs6v2YfU
 4. Gradient descent
     - Stochastic gradient descent (SGD): a compute-efficient version of gradient that only uses a **minibatch** (subset) of training data to compute the gradient.
         - A side effect of SGD is that it helps escape local minima because of its randomness
 5. Backpropagation
     - An efficient algorithm for computing gradients
 
+### References
+- https://www.3blue1brown.com/lessons/neural-networks
+- https://www.3blue1brown.com/lessons/gradient-descent
+- https://www.3blue1brown.com/lessons/neural-network-analysis/
+- https://www.3blue1brown.com/lessons/backpropagation/
+- https://www.3blue1brown.com/lessons/backpropagation-calculus/
+
+
+## Setup
+
+- If you don't have Anaconda/`conda`/`mamba` installed on your computer (WSL/macOS/Linux), then install Micromamba by running the following command in your terminal:
+    ```bash
+    # for Linux users
+    "${SHELL}" <(curl -L micro.mamba.pm)
+
+    # for macOS users
+    brew install micromamba
+    ```
+- Additionall, [install `uv`](https://docs.astral.sh/uv/getting-started/installation/#homebrew) if you don't have it already:
+    ```bash
+    # for Linux users
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    # for macOS users
+    brew install uv
+    ```
+- Install the dependencies:
+    ```bash
+    uv sync
+    ```
+
 ## Feedforward networks
 
-- References
+### Background
+- What is a neural network?
     - https://www.3blue1brown.com/lessons/neural-networks
     - https://www.3blue1brown.com/lessons/neural-network-analysis/
 - Feedforward networks are also called **multilayer perceptrons (MLPs)**.
@@ -43,74 +83,61 @@
     - Image dimensions: 28 × 28 pixels (784 pixels)
     - Classes: 10 (digits 0–9)
 
-### Notes
+### Experiment
 
-- If you don't have Anaconda/`conda`/`mamba` installed on your computer (WSL/macOS/Linux), then install Micromamba by running the following command in your terminal:
-    ```bash
-    "${SHELL}" <(curl -L micro.mamba.pm)
-    ```
-- Create a `conda`/`mamba`/`micromamba` (use the one you have installed) environment for 20.A04:
-    ```bash
-    micromamba create -n 20.A04 python=3.12
-    ```
-- Activate the environment:
-    ```bash
-    micromamba activate 20.A04
-    ```
-- Install the dependencies:
-    ```bash
-    pip install jax equinox einops numpy optax trackio tqdm
-    ```
 - Run the training script:
     ```bash
-    python train.py
+    uv run python train.py
     ```
-- In another terminal, activate the environment and then start the [Trackio](https://github.com/gradio-app/trackio) viewer:
+- In another terminal, `cd` into this repository, and then start the [Trackio](https://github.com/gradio-app/trackio) viewer:
     ```bash
-    micromamba activate 20.A04
-    trackio show
+    uv run trackio show
     ```
 - Now, you can play with different hyperparameters of the model and see how it affects performance:
     ```bash
     # show available options
-    python train.py --help
+    uv run python train.py --help
 
     # change number of epochs
-    python train.py --epochs 20
+    uv run python train.py --epochs 20
 
     # change hidden size; you are training on CPU, so this number can't be too high
-    python train.py --hidden-size 32
+    uv run python train.py --hidden-size 32
     ```
 - You can also visualize the dataset:
     ```bash
-    python visualize_data.py --split train --index 0 --count 10
+    uv run python visualize_data.py --split train --index 0 --count 10
     ```
 
 ## Convolutional neural networks (CNNs)
 
-`mnist/train_cnn.py` follows the same five-section structure as `train.py`.
+### Background
 
-Its `CNN(eqx.Module)` uses Equinox `Conv2d`, `MaxPool2d`, and `Linear` layers: two SAME-padded convolutions with ReLU and 2×2 max pooling, followed by a ReLU dense layer and ten raw class logits.
+- What is a kernel convolution?
+    - How blurs and filters work (Computerphile): https://www.youtube.com/watch?v=C_zFhWdM4ic
+    - Sobel edge operator (Computerphile): https://www.youtube.com/watch?v=uihBwtPIBxM
+- What is a convolutional neural network?
+    - Convolutional neural networks (Computerphile): https://www.youtube.com/watch?v=py5byOOHZM8
+
+### Experiment
+
+`mnist/train_cnn.py` trains a CNN to recognize the MNIST dataset of handwritten digits.
+
+The model has two convolution layers, followed by a max pooling layer, one hidden linear layer, and finally the output layer.
 
 Metrics are logged to the `mnist-cnn` Trackio project.
 
 ```bash
-python train_cnn.py --help
-python train_cnn.py --channels 8 16 --kernel-size 3 --hidden-size 16 \
+uv run python train_cnn.py --help
+uv run python train_cnn.py --channels 8 16 --kernel-size 3 --hidden-size 16 \
     --learning-rate 1.0 --batch-size 100 --epochs 10 --seed 0
 ```
 
 The values above are the defaults. `--channels` takes the output channel count for each convolution; `--kernel-size` controls both square kernels; `--hidden-size` controls the dense hidden layer.
 
-### References
 
-- CNNs
-    - How blurs and filters work (Computerphile): https://www.youtube.com/watch?v=C_zFhWdM4ic
-    - Sobel edge operator (Computerphile): https://www.youtube.com/watch?v=uihBwtPIBxM
-    - Convolutional neural networks (Computerphile): https://www.youtube.com/watch?v=py5byOOHZM8
-- Categorical cross-entropy
-    - Entropy (3Blue1Brown): https://www.youtube.com/watch?v=l6DKRf-fAAM
-    - Cross-entropy (understanding categorical cross-entropy loss; 3Blue1Brown): https://www.youtube.com/watch?v=GlYgs6v2YfU
+## Recurrent neural networks: RNNs, LSTMs, GRUs
+
 
 ## Attention and transformers
 

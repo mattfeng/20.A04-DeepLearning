@@ -1,5 +1,6 @@
 import argparse
 import gzip
+from functools import partial
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -16,15 +17,16 @@ from tqdm.auto import tqdm
 # 1. Hyperparameters
 # --------------------------------------------------
 
-parser = argparse.ArgumentParser()
+def parse_args():
+    parser = argparse.ArgumentParser()
 
-parser.add_argument("--learning-rate", type=float, default=1.0)
-parser.add_argument("--batch-size", type=int, default=100)
-parser.add_argument("--epochs", type=int, default=10)
-parser.add_argument("--hidden-size", type=int, default=16)
-parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--learning-rate", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--hidden-size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=0)
 
-args = parser.parse_args()
+    return parser.parse_args()
 
 
 # --------------------------------------------------
@@ -67,9 +69,6 @@ def predict(params, images):
 # 3. Loss and training
 # --------------------------------------------------
 
-optimizer = optax.sgd(args.learning_rate)
-
-
 def loss(params, images, labels):
     logits = predict(params, images)
     return jnp.mean(
@@ -77,8 +76,8 @@ def loss(params, images, labels):
     )
 
 
-@jax.jit
-def train_step(params, opt_state, images, labels):
+@partial(jax.jit, static_argnames=("optimizer",))
+def train_step(params, opt_state, images, labels, optimizer):
     value, gradients = jax.value_and_grad(loss)(
         params, images, labels
     )
@@ -131,66 +130,75 @@ def load_mnist(split):
 # 5. Training
 # --------------------------------------------------
 
-train_images, train_labels = load_mnist("train")
-test_images, test_labels = load_mnist("test")
+def main():
+    args = parse_args()
+    optimizer = optax.sgd(args.learning_rate)
 
-# Reserve 5,000 training examples for validation.
-val_images = train_images[-5000:]
-val_labels = train_labels[-5000:]
+    train_images, train_labels = load_mnist("train")
+    test_images, test_labels = load_mnist("test")
 
-train_images = train_images[:-5000]
-train_labels = train_labels[:-5000]
+    # Reserve 5,000 training examples for validation.
+    val_images = train_images[-5000:]
+    val_labels = train_labels[-5000:]
 
-params = init(jax.random.key(args.seed), args.hidden_size)
-opt_state = optimizer.init(params)
-rng = np.random.default_rng(args.seed)
+    train_images = train_images[:-5000]
+    train_labels = train_labels[:-5000]
 
-# Trackio stores the configuration and metrics locally.
-trackio.init(
-    project="mnist-3b1b",
-    config=vars(args),
-)
+    params = init(jax.random.key(args.seed), args.hidden_size)
+    opt_state = optimizer.init(params)
+    rng = np.random.default_rng(args.seed)
 
-for epoch in range(args.epochs):
-    indices = rng.permutation(len(train_images))
-    epoch_loss = 0.0
-
-    for start in tqdm(
-        range(0, len(indices), args.batch_size),
-        desc=f"Epoch {epoch + 1}/{args.epochs}",
-        unit="batch",
-    ):
-        batch = indices[start:start + args.batch_size]
-
-        params, opt_state, batch_loss = train_step(
-            params,
-            opt_state,
-            train_images[batch],
-            train_labels[batch],
-        )
-
-        epoch_loss += batch_loss * len(batch)
-
-    train_loss = float(epoch_loss / len(train_images))
-    val_accuracy = float(accuracy(params, val_images, val_labels))
-
-    # One Trackio logging step per epoch.
-    trackio.log({
-        "epoch": epoch + 1,
-        "train_loss": train_loss,
-        "val_accuracy": val_accuracy,
-    })
-
-    print(
-        f"Epoch {epoch + 1:02d} | "
-        f"Loss: {train_loss:.4f} | "
-        f"Validation accuracy: {val_accuracy:.2%}"
+    # Trackio stores the configuration and metrics locally.
+    trackio.init(
+        project="mnist-3b1b",
+        config=vars(args),
     )
 
-# Evaluate the held-out test set after training.
-test_accuracy = float(accuracy(params, test_images, test_labels))
-trackio.log({"test_accuracy": test_accuracy})
+    for epoch in range(args.epochs):
+        indices = rng.permutation(len(train_images))
+        epoch_loss = 0.0
 
-print(f"Test accuracy: {test_accuracy:.2%}")
+        for start in tqdm(
+            range(0, len(indices), args.batch_size),
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            unit="batch",
+        ):
+            batch = indices[start:start + args.batch_size]
 
-trackio.finish()
+            params, opt_state, batch_loss = train_step(
+                params,
+                opt_state,
+                train_images[batch],
+                train_labels[batch],
+                optimizer,
+            )
+
+            epoch_loss += batch_loss * len(batch)
+
+        train_loss = float(epoch_loss / len(train_images))
+        val_accuracy = float(accuracy(params, val_images, val_labels))
+
+        # One Trackio logging step per epoch.
+        trackio.log({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_accuracy": val_accuracy,
+        })
+
+        print(
+            f"Epoch {epoch + 1:02d} | "
+            f"Loss: {train_loss:.4f} | "
+            f"Validation accuracy: {val_accuracy:.2%}"
+        )
+
+    # Evaluate the held-out test set after training.
+    test_accuracy = float(accuracy(params, test_images, test_labels))
+    trackio.log({"test_accuracy": test_accuracy})
+
+    print(f"Test accuracy: {test_accuracy:.2%}")
+
+    trackio.finish()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,204 @@
+"""Train and compare sequence models on a fixed arithmetic completion task."""
+
+import argparse
+
+import einops
+import equinox as eqx
+import grain
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import trackio
+from jaxtyping import Array, Bool, Float, Int
+
+from data import EOS_ID, PAD_ID, VOCAB, Example, decode, encode, encode_example, generate_data
+from rnn_model import RNN
+
+
+def batches(examples, sequence_length, batch_size, *, shuffle_seed=None):
+    source = [encode_example(example, sequence_length) for example in examples]
+    dataset = grain.MapDataset.source(source)
+    if shuffle_seed is not None:
+        dataset = dataset.shuffle(seed=shuffle_seed)
+    return dataset.batch(batch_size, drop_remainder=False).to_iter_dataset()
+
+
+@eqx.filter_jit
+def loss(
+    model: eqx.Module,
+    inputs: Int[Array, "batch time"],
+    targets: Int[Array, "batch time"],
+    mask: Bool[Array, "batch time"],
+) -> Float[Array, ""]:
+    logits = jax.vmap(model)(inputs)
+    # Flatten batch/time identically for logits, labels, and the selected mask.
+    logits = einops.rearrange(logits, "batch time vocab -> (batch time) vocab")
+    targets = einops.rearrange(targets, "batch time -> (batch time)")
+    weights = einops.rearrange(mask, "batch time -> (batch time)")
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    return jnp.sum(losses * weights) / jnp.sum(weights)
+
+
+@eqx.filter_jit
+def train_step(model, state, batch, optimizer):
+    value, gradients = eqx.filter_value_and_grad(loss)(
+        model, batch["inputs"], batch["targets"], batch["mask"]
+    )
+    updates, state = optimizer.update(
+        gradients, state, eqx.filter(model, eqx.is_inexact_array)
+    )
+    return eqx.apply_updates(model, updates), state, value
+
+
+@eqx.filter_jit
+def complete(model, prompts, prompt_lengths, completion_length):
+    """Generic greedy decoding using only the model's sequence/logits contract."""
+    rows = jnp.arange(prompts.shape[0])
+
+    def step(index, carry):
+        tokens, finished = carry
+        positions = prompt_lengths - 1 + index
+        logits = jax.vmap(model)(tokens)
+        next_tokens = jnp.argmax(logits[rows, positions], axis=-1)
+        next_tokens = jnp.where(finished, PAD_ID, next_tokens)
+        tokens = tokens.at[rows, positions + 1].set(next_tokens, mode="drop")
+        return tokens, finished | (next_tokens == EOS_ID)
+
+    tokens, _ = jax.lax.fori_loop(
+        0, completion_length, step,
+        (prompts, jnp.zeros(prompts.shape[0], dtype=jnp.bool_)),
+    )
+    return tokens
+
+
+def completion_batch(examples: tuple[Example, ...], sequence_length: int):
+    prompts = np.full((len(examples), sequence_length), PAD_ID, dtype=np.int32)
+    lengths = np.asarray([len(e.prompt) for e in examples], dtype=np.int32)
+    for row, example in enumerate(examples):
+        prompts[row, : lengths[row]] = encode(example.prompt)
+    return prompts, lengths
+
+
+def extract_answer(completion: str) -> str | None:
+    """Score only the final colon-delimited answer before the first EOS."""
+    body, eos, _ = completion.partition("$")
+    _, separator, answer = body.rpartition(":")
+    return answer if separator and eos else None
+
+
+def evaluate(model, examples, data, batch_size):
+    weighted_loss = 0.0
+    token_count = 0
+    for batch in batches(examples, data.sequence_length, batch_size):
+        count = int(np.sum(batch["answer_mask"]))
+        weighted_loss += float(
+            loss(model, batch["inputs"], batch["targets"], batch["answer_mask"])
+        ) * count
+        token_count += count
+    correct = 0
+    for start in range(0, len(examples), batch_size):
+        subset = examples[start : start + batch_size]
+        prompts, lengths = completion_batch(subset, data.sequence_length)
+        predictions = np.asarray(complete(model, prompts, lengths, data.completion_length))
+        for example, prediction in zip(subset, predictions):
+            completion = "".join(VOCAB[int(token)] for token in prediction[len(example.prompt):])
+            correct += extract_answer(completion) == example.answer
+    return {"loss": weighted_loss / token_count, "exact_accuracy": correct / len(examples)}
+
+
+def run_experiment(model: eqx.Module, data, args):
+    """Accept any deterministic Equinox sequence model; data/splits stay shared."""
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.learning_rate))
+    state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    trackio.init(
+        project=args.project,
+        name=args.name,
+        config={
+            **vars(args),
+            "architecture": type(model).__name__,
+            "train_examples": len(data.train),
+            "validation_examples": len(data.validation),
+            "test_examples": len(data.test),
+            "sequence_length": data.sequence_length,
+            "completion_length": data.completion_length,
+            "vocab": VOCAB,
+            "gradient_clip_norm": 1.0,
+            "backend": jax.default_backend(),
+        },
+    )
+    try:
+        baseline = evaluate(model, data.validation, data, args.batch_size)
+        trackio.log({"epoch": 0, **{f"validation/{k}": v for k, v in baseline.items()}})
+        print(f"Untrained validation: {baseline}", flush=True)
+        for epoch in range(1, args.epochs + 1):
+            weighted_loss = 0.0
+            token_count = 0
+            for batch in batches(
+                data.train, data.sequence_length, args.batch_size,
+                shuffle_seed=args.seed + epoch,
+            ):
+                model, state, value = train_step(model, state, batch, optimizer)
+                count = int(np.sum(batch["mask"]))
+                weighted_loss += float(value) * count
+                token_count += count
+            validation = evaluate(model, data.validation, data, args.batch_size)
+            train_loss = weighted_loss / token_count
+            trackio.log({
+                "epoch": epoch,
+                "train/loss": train_loss,
+                **{f"validation/{k}": v for k, v in validation.items()},
+            })
+            print(
+                f"Epoch {epoch:03d} | train loss {train_loss:.4f} | "
+                f"validation loss {validation['loss']:.4f} | "
+                f"validation exact {validation['exact_accuracy']:.2%}",
+                flush=True,
+            )
+        # Test labels are evaluated only after the fixed training schedule.
+        test = evaluate(model, data.test, data, args.batch_size)
+        trackio.log({f"test/{k}": v for k, v in test.items()})
+        print(f"Test: {test}", flush=True)
+        examples = data.validation[:5]
+        prompts, lengths = completion_batch(examples, data.sequence_length)
+        predictions = np.asarray(complete(model, prompts, lengths, data.completion_length))
+        for example, prediction in zip(examples, predictions):
+            print(f"{example.prompt} -> {decode(prediction)[len(example.prompt):]} "
+                  f"(expected {example.answer})")
+    finally:
+        trackio.finish()
+    return model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-operand", type=int, default=19)
+    parser.add_argument("--operations", default="+-*")
+    parser.add_argument("--dataset-size", type=int, default=120)
+    parser.add_argument("--completion-length", type=int, default=32)
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--project", default="arithmetic")
+    parser.add_argument("--name", default=None)
+    args = parser.parse_args()
+    if min(args.hidden_size, args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
+        parser.error("hidden-size, batch-size, epochs, and learning-rate must be positive")
+    return args
+
+
+def main():
+    args = parse_args()
+    data = generate_data(
+        max_operand=args.max_operand, operations=args.operations, seed=args.seed,
+        completion_length=args.completion_length,
+        dataset_size=args.dataset_size,
+    )
+    model = RNN(len(VOCAB), args.hidden_size, key=jax.random.key(args.seed))
+    run_experiment(model, data, args)
+
+
+if __name__ == "__main__":
+    main()
