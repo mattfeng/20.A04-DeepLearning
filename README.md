@@ -11,7 +11,7 @@ uv run mnist/train.py
 uv run math/experiment.py
 ```
 
-See [arithmetic experiments](math/README.md) for task configuration and metrics.
+See [arithmetic experiments](#recurrent-neural-networks-rnns-lstms-grus) below.
 
 ## Math foundations
 - [3Blue1Brown's Linear Algebra series](https://www.youtube.com/playlist?list=PLZHQObOWTQDPD3MizzM2xVFitgF8hE_ab)
@@ -137,6 +137,64 @@ The values above are the defaults. `--channels` takes the output channel count f
 
 
 ## Recurrent neural networks: RNNs, LSTMs, GRUs
+
+`math/` compares causal sequence models on arithmetic completion, starting with
+a vanilla tanh RNN. From the repository root:
+
+```bash
+uv run math/data.py --max-operand 19 --dataset-size 120 --seed 0
+uv run math/experiment.py --name vanilla-rnn-seed0
+uv run trackio show
+```
+
+The generator pages each equation once, grouped by split, with thinking lengths
+listed at the top (`$PAGER` when set). Redirecting output disables interactive paging.
+Use `--sort equation` for numeric left operand, operator (`+`, `-`, `*`), then
+right operand order; `--sort operand-size` orders by the larger operand, then the
+smaller, ascending. Sorting stays within each split; default `--sort dataset`
+preserves the sampled order and never changes training data.
+
+Initial training run:
+
+```bash
+uv run math/experiment.py \
+    --max-operand 999 \
+    --dataset-size 10000 \
+    --hidden-size 128 \
+    --batch-size 128 \
+    --epochs 100 \
+    --learning-rate 0.001 \
+    --seed 0
+```
+
+- `--dataset-size` counts unique equations across all splits (default 120);
+  sampling balances operand digit lengths. Operands include 0 and `--max-operand`.
+- `--thinking-steps 0 1 2 4 8` (default on both CLIs) adds five `~`-prefix variants
+  per equation without consuming `--dataset-size`: 120 equations become 600 rows.
+  Variants stay in the same split. Use `--thinking-steps 0` for the no-thinking baseline.
+- `--operations` selects from `+`, `-`, `*`; `--completion-length` caps generation
+  (default 32). Use `--help` for all options and defaults. CPU is sufficient.
+- Prompt `12+7=` → completion `~~~~:19$` with four thinking steps. Training learns
+  `~`, delimiter, answer, and EOS; evaluation loss scores only answer/EOS across
+  variants. Exact accuracy decodes each unique equation once and ignores content
+  before the final answer. Trackio project: `arithmetic`.
+- Final weights (`model.eqx`) and run metadata (`config.json`) are saved under
+  `artifacts/math/<trackio-run-name>/` (override the parent with `--output-dir`).
+  Trackio generates the name unless `--name` is provided. Existing directories
+  are not overwritten. The runner calls `model.save_artifact(config, output_dir)`;
+  reload with `RNN.load_artifact(path)`. Optimizer state is not saved.
+- Sampling, metric, and model-interface details live in the docstrings in
+  [`math/data.py`](math/data.py) and [`math/experiment.py`](math/experiment.py).
+
+Try a saved model interactively (use the run path printed after training):
+
+```bash
+uv run math/repl.py artifacts/math/your-trackio-run-name
+```
+
+Enter equations such as `12+7` or `3-9=`. The REPL shows the raw completion,
+extracted answer, expected answer, and exact-match result. `:help` shows input
+syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
 
 
 ## Attention and transformers

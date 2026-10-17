@@ -12,6 +12,7 @@ VOCAB = "_0123456789+-*=$~:"
 PAD_ID = VOCAB.index("_")
 EOS_ID = VOCAB.index("$")
 OPERATIONS = {"+": operator.add, "-": operator.sub, "*": operator.mul}
+DEFAULT_THINKING_STEPS = (0, 1, 2, 4, 8, 16)
 
 
 def encode(text: str) -> Int[np.ndarray, "tokens"]:
@@ -26,10 +27,11 @@ def decode(tokens: Int[np.ndarray, "tokens"]) -> str:
 class Example:
     prompt: str
     answer: str
+    thinking_steps: int = 0
 
     @property
     def completion(self) -> str:
-        return ":" + self.answer + "$"
+        return "~" * self.thinking_steps + ":" + self.answer + "$"
 
 
 @dataclass(frozen=True)
@@ -39,18 +41,30 @@ class ArithmeticData:
     test: tuple[Example, ...]
     sequence_length: int
     completion_length: int
+    thinking_steps: tuple[int, ...]
 
 
 def generate_data(
     *, max_operand: int = 19, operations: str = "+-*", seed: int = 0,
     completion_length: int = 32, dataset_size: int = 120,
+    thinking_steps: tuple[int, ...] = DEFAULT_THINKING_STEPS,
 ) -> ArithmeticData:
     """Balance operator/operand-length groups, then randomly split 80/10/10.
 
     Operands include zero and max_operand. Subtraction may be negative.
     Commuted expressions are distinct prompts and may occur in different splits.
-    Sample dataset_size unique equations, balancing both operands' digit lengths.
-    Exhausted groups donate their quota to the remaining groups.
+    Sample dataset_size unique equations without enumerating the full space.
+    Balance (operator, left digits, right digits) quotas within one example,
+    redistributing quota from exhausted groups. Zero has one digit; the longest
+    range ends at max_operand. Sampling within each group is uniform.
+
+    Shuffle unique equations with seed, then reserve floor(dataset_size / 10) for
+    each held-out split. Expand each equation into thinking_steps variants only
+    after splitting; these variants do not count against dataset_size.
+    Digit-length balance applies to the combined equations, not individual splits.
+    Metrics describe digit-balanced interpolation, not uniform integer pairs.
+    completion_length must fit the longest thinking prefix, delimiter, answer,
+    and EOS.
     """
     if max_operand < 1:
         raise ValueError("max_operand must be at least 1")
@@ -58,6 +72,13 @@ def generate_data(
         raise ValueError("operations must be nonempty and contain no duplicates")
     if any(op not in OPERATIONS for op in operations):
         raise ValueError("supported operations are +, -, and *")
+    thinking_steps = tuple(thinking_steps)
+    if (
+        not thinking_steps
+        or any(steps < 0 for steps in thinking_steps)
+        or any(left >= right for left, right in zip(thinking_steps, thinking_steps[1:]))
+    ):
+        raise ValueError("thinking_steps must be nonempty, nonnegative, and strictly increasing")
     operand_count = max_operand + 1
     pairs_per_operation = operand_count ** 2
     population_size = len(operations) * pairs_per_operation
@@ -97,25 +118,43 @@ def generate_data(
             a_offset, b_offset = divmod(index, b_count)
             a, b = a_min + a_offset, b_min + b_offset
             examples.append(Example(f"{a}{op}{b}=", str(OPERATIONS[op](a, b))))
-    if completion_length < max(len(e.completion) for e in examples):
-        raise ValueError("completion_length must fit the answer delimiter, answer, and EOS")
+    required_completion = thinking_steps[-1] + max(len(e.completion) for e in examples)
+    if completion_length < required_completion:
+        raise ValueError(
+            f"completion_length must be at least {required_completion} to fit thinking, "
+            "the answer delimiter, answer, and EOS"
+        )
     rng.shuffle(examples)
     shuffled = tuple(examples)
     held_out = dataset_size // 10
+
+    def variants(equations):
+        return tuple(
+            Example(example.prompt, example.answer, steps)
+            for example in equations
+            for steps in thinking_steps
+        )
+
     return ArithmeticData(
-        train=shuffled[: -2 * held_out],
-        validation=shuffled[-2 * held_out : -held_out],
-        test=shuffled[-held_out:],
+        train=variants(shuffled[: -2 * held_out]),
+        validation=variants(shuffled[-2 * held_out : -held_out]),
+        test=variants(shuffled[-held_out:]),
         sequence_length=(
             max(len(e.prompt) for e in examples)
             + completion_length
         ),
         completion_length=completion_length,
+        thinking_steps=thinking_steps,
     )
 
 
 def encode_example(example: Example, sequence_length: int) -> dict[str, np.ndarray]:
-    """Supervise the completion; expose a second mask for answer-only metrics."""
+    """Encode prompt + ~...:answer$ with right padding.
+
+    mask supervises thinking, delimiter, answer, and EOS; answer_mask includes
+    only answer characters and EOS.
+    Both exclude prompt and padding; losses normalize by supervised token count.
+    """
     text = encode(example.prompt + example.completion)
     tokens = np.full(sequence_length, PAD_ID, dtype=np.int32)
     tokens[: len(text)] = text
@@ -123,7 +162,7 @@ def encode_example(example: Example, sequence_length: int) -> dict[str, np.ndarr
     mask: Bool[np.ndarray, "time"] = (
         (positions >= len(example.prompt) - 1) & (positions < len(text) - 1)
     )
-    answer_mask = mask & (positions >= len(example.prompt))
+    answer_mask = mask & (positions >= len(example.prompt) + example.thinking_steps)
     return {
         "inputs": tokens[:-1], "targets": tokens[1:],
         "mask": mask, "answer_mask": answer_mask,
@@ -132,6 +171,7 @@ def encode_example(example: Example, sequence_length: int) -> dict[str, np.ndarr
 
 if __name__ == "__main__":
     import argparse
+    import pydoc
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-operand", type=int, default=19)
@@ -139,10 +179,35 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dataset-size", type=int, default=120)
     parser.add_argument("--completion-length", type=int, default=32)
-    args = parser.parse_args()
-    data = generate_data(**vars(args))
+    parser.add_argument(
+        "--thinking-steps", type=int, nargs="+", default=DEFAULT_THINKING_STEPS,
+        help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
+    )
+    parser.add_argument(
+        "--sort", choices=("dataset", "equation", "operand-size"), default="dataset",
+        help="Viewer order within each split: sampled order, left/operator/right, or max/min operand",
+    )
+    options = vars(parser.parse_args())
+    sort_order = options.pop("sort")
+    data = generate_data(**options)
+    operator_order = {op: index for index, op in enumerate(OPERATIONS)}
+
+    def sort_key(example):
+        op = next(op for op in OPERATIONS if op in example.prompt)
+        left, right = map(int, example.prompt[:-1].split(op))
+        equation = (left, operator_order[op], right)
+        if sort_order == "operand-size":
+            return (max(left, right), min(left, right), *equation)
+        return equation
+
+    thinking_lengths = ", ".join(map(str, data.thinking_steps))
+    lines = [f"Thinking steps (~ tokens): {thinking_lengths}", ""]
     for name in ("train", "validation", "test"):
         examples = getattr(data, name)
-        print(f"{name}: {len(examples)} equations")
-        for example in examples[:5]:
-            print(f"  {example.prompt}{example.completion}")
+        equations = tuple({example.prompt: example for example in examples}.values())
+        if sort_order != "dataset":
+            equations = sorted(equations, key=sort_key)
+        lines.append(f"{name}: {len(equations)} equations, {len(examples)} variants")
+        lines.extend(f"  {example.prompt}:{example.answer}$" for example in equations)
+        lines.append("")
+    pydoc.pager("\n".join(lines))

@@ -12,7 +12,10 @@ import optax
 import trackio
 from jaxtyping import Array, Bool, Float, Int
 
-from data import EOS_ID, PAD_ID, VOCAB, Example, decode, encode, encode_example, generate_data
+from data import (
+    DEFAULT_THINKING_STEPS, EOS_ID, PAD_ID, VOCAB, Example, decode, encode,
+    encode_example, generate_data,
+)
 from rnn_model import RNN
 
 
@@ -53,7 +56,10 @@ def train_step(model, state, batch, optimizer):
 
 @eqx.filter_jit
 def complete(model, prompts, prompt_lengths, completion_length):
-    """Generic greedy decoding using only the model's sequence/logits contract."""
+    """Greedily decode to EOS or completion_length, including intermediate text.
+
+    Recompute sequence logits per token; no architecture-specific cache contract.
+    """
     rows = jnp.arange(prompts.shape[0])
 
     def step(index, carry):
@@ -81,13 +87,23 @@ def completion_batch(examples: tuple[Example, ...], sequence_length: int):
 
 
 def extract_answer(completion: str) -> str | None:
-    """Score only the final colon-delimited answer before the first EOS."""
+    """Score the last :answer before the first EOS; require both delimiters.
+
+    Ignore intermediate content: 1+1=0:9:2$ scores as 2. Extra answer characters
+    remain part of the answer and fail exact matching.
+    """
     body, eos, _ = completion.partition("$")
     _, separator, answer = body.rpartition(":")
     return answer if separator and eos else None
 
 
+def _unique_equations(examples):
+    """Collapse thinking variants while preserving the original equation order."""
+    return tuple({example.prompt: example for example in examples}.values())
+
+
 def evaluate(model, examples, data, batch_size):
+    """Answer/EOS loss across variants; greedy exact accuracy per unique equation."""
     weighted_loss = 0.0
     token_count = 0
     for batch in batches(examples, data.sequence_length, batch_size):
@@ -97,37 +113,52 @@ def evaluate(model, examples, data, batch_size):
         ) * count
         token_count += count
     correct = 0
-    for start in range(0, len(examples), batch_size):
-        subset = examples[start : start + batch_size]
+    equations = _unique_equations(examples)
+    for start in range(0, len(equations), batch_size):
+        subset = equations[start : start + batch_size]
         prompts, lengths = completion_batch(subset, data.sequence_length)
         predictions = np.asarray(complete(model, prompts, lengths, data.completion_length))
         for example, prediction in zip(subset, predictions):
             completion = "".join(VOCAB[int(token)] for token in prediction[len(example.prompt):])
             correct += extract_answer(completion) == example.answer
-    return {"loss": weighted_loss / token_count, "exact_accuracy": correct / len(examples)}
+    return {"loss": weighted_loss / token_count, "exact_accuracy": correct / len(equations)}
 
 
 def run_experiment(model: eqx.Module, data, args):
-    """Accept any deterministic Equinox sequence model; data/splits stay shared."""
+    """Train a deterministic causal Equinox model; keep data and splits shared.
+
+    The shared-vocabulary contract is integer tokens (time,) -> raw logits
+    (time, vocab), plus model.save_artifact(config, output_dir). Models own their
+    serialization and reconstruction metadata. For architecture comparisons, fix
+    seed, dataset size, operand range, operations, splits, thinking budgets, limit,
+    schedule, and metrics.
+
+    Log untrained validation at epoch 0, then training/validation each epoch.
+    Training shuffles with seed + epoch; evaluation order stays deterministic.
+    Trackio logs locally; use distinct run names. Save final inference artifacts
+    before test evaluation; optimizer state is not saved.
+    """
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.learning_rate))
     state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
-    trackio.init(
-        project=args.project,
-        name=args.name,
-        config={
-            **vars(args),
-            "architecture": type(model).__name__,
-            "train_examples": len(data.train),
-            "validation_examples": len(data.validation),
-            "test_examples": len(data.test),
-            "sequence_length": data.sequence_length,
-            "completion_length": data.completion_length,
-            "vocab": VOCAB,
-            "gradient_clip_norm": 1.0,
-            "backend": jax.default_backend(),
-        },
-    )
+    config = {
+        **vars(args),
+        "architecture": type(model).__name__,
+        "thinking_steps": data.thinking_steps,
+        "train_equations": len(data.train) // len(data.thinking_steps),
+        "validation_equations": len(data.validation) // len(data.thinking_steps),
+        "test_equations": len(data.test) // len(data.thinking_steps),
+        "train_examples": len(data.train),
+        "validation_examples": len(data.validation),
+        "test_examples": len(data.test),
+        "sequence_length": data.sequence_length,
+        "completion_length": data.completion_length,
+        "vocab": VOCAB,
+        "gradient_clip_norm": 1.0,
+        "backend": jax.default_backend(),
+    }
+    run = trackio.init(project=args.project, name=args.name, config=config)
     try:
+        config["name"] = run.name
         baseline = evaluate(model, data.validation, data, args.batch_size)
         trackio.log({"epoch": 0, **{f"validation/{k}": v for k, v in baseline.items()}})
         print(f"Untrained validation: {baseline}", flush=True)
@@ -155,11 +186,13 @@ def run_experiment(model: eqx.Module, data, args):
                 f"validation exact {validation['exact_accuracy']:.2%}",
                 flush=True,
             )
+        directory = model.save_artifact(config, args.output_dir)
+        print(f"Saved model artifact: {directory}", flush=True)
         # Test labels are evaluated only after the fixed training schedule.
         test = evaluate(model, data.test, data, args.batch_size)
         trackio.log({f"test/{k}": v for k, v in test.items()})
         print(f"Test: {test}", flush=True)
-        examples = data.validation[:5]
+        examples = _unique_equations(data.validation)[:5]
         prompts, lengths = completion_batch(examples, data.sequence_length)
         predictions = np.asarray(complete(model, prompts, lengths, data.completion_length))
         for example, prediction in zip(examples, predictions):
@@ -176,6 +209,10 @@ def parse_args():
     parser.add_argument("--operations", default="+-*")
     parser.add_argument("--dataset-size", type=int, default=120)
     parser.add_argument("--completion-length", type=int, default=32)
+    parser.add_argument(
+        "--thinking-steps", type=int, nargs="+", default=DEFAULT_THINKING_STEPS,
+        help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
+    )
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
@@ -183,6 +220,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--project", default="arithmetic")
     parser.add_argument("--name", default=None)
+    parser.add_argument(
+        "--output-dir", default="artifacts/math",
+        help="Parent directory for unique run directories containing final weights and config",
+    )
     args = parser.parse_args()
     if min(args.hidden_size, args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
         parser.error("hidden-size, batch-size, epochs, and learning-rate must be positive")
@@ -195,6 +236,7 @@ def main():
         max_operand=args.max_operand, operations=args.operations, seed=args.seed,
         completion_length=args.completion_length,
         dataset_size=args.dataset_size,
+        thinking_steps=args.thinking_steps,
     )
     model = RNN(len(VOCAB), args.hidden_size, key=jax.random.key(args.seed))
     run_experiment(model, data, args)
