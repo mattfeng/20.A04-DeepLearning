@@ -1,0 +1,57 @@
+{
+  "name": "Pi autoresearch: experiments",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "node",
+  "overrideCommand": false,
+  "updateRemoteUserUID": true,
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": {
+            "path": "/bin/zsh",
+            "args": ["-l"]
+          }
+        }
+      }
+    }
+  },
+  "workspaceFolder": "/workspace/experiments",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/experiments,type=bind",
+  "mounts": [
+
+    "source=${localWorkspaceFolder}/../README.md,target=/project/README.md,type=bind,readonly",
+
+    "source=${localWorkspaceFolder}/../math,target=/project/math,type=bind,readonly",
+
+    "source=${localWorkspaceFolder}/../pyproject.toml,target=/project/pyproject.toml,type=bind,readonly",
+
+    "source=${localWorkspaceFolder}/../uv.lock,target=/project/uv.lock,type=bind,readonly",
+
+    "source=autoresearch-pi-079347924e,target=/home/node/.pi,type=volume"
+  ],
+  "containerEnv": {
+    "PYTHONPATH": "/project:/project/src",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "TRACKIO_DIR": "/workspace/experiments/trackio",
+    "TRACKIO_STORAGE_MODE": "jsonl",
+    "TRACKIO_SQLITE_MMAP_SIZE": "0",
+    "XDG_CACHE_HOME": "/workspace/experiments/results/.cache",
+    "UV_CACHE_DIR": "/workspace/experiments/results/.cache/uv",
+    "JAX_COMPILATION_CACHE_DIR": "/workspace/experiments/results/.cache/jax",
+    "UV_PROJECT_ENVIRONMENT": "/tmp/experiments/.venv"
+  },
+  "runArgs": [
+    "--shm-size=1g",
+    "--cap-drop=ALL",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=SETUID",
+    "--cap-add=SETGID",
+    "--cap-add=SETPCAP",
+    "--security-opt=no-new-privileges",
+    "--pids-limit=512"
+  ]
+}

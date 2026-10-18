@@ -1,0 +1,25 @@
+# One hostname per line. This file is copied into the root-owned image.
+# Changes require rebuilding the image; DNS address changes require a restart.
+
+# Pi, model APIs, and authentication
+api.anthropic.com
+api.openai.com
+auth.openai.com
+chatgpt.com
+pi.dev
+
+# Package downloads
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+
+# GitHub HTTPS access
+github.com
+api.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+
+# VS Code extensions and updates
+marketplace.visualstudio.com
+vscode.blob.core.windows.net
+update.code.visualstudio.com
