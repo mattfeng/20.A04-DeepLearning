@@ -1,7 +1,10 @@
 """Train and compare sequence models on a fixed arithmetic completion task."""
 
 import argparse
+import json
 import math
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import einops
 import equinox as eqx
@@ -20,6 +23,88 @@ from data import (
 )
 from lstm_model import LSTM
 from rnn_model import RNN
+
+
+class VariationalWeights(eqx.Module):
+    """Diagonal Gaussian over every inexact model leaf; static architecture is shared."""
+
+    mean: eqx.Module
+    raw_scales: tuple[Array, ...]
+    prior_scale: float = eqx.field(static=True)
+
+    def __init__(self, model, prior_scale=1.0):
+        self.mean = model
+        self.prior_scale = prior_scale
+        parameters = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_inexact_array))
+        # Initial posterior standard deviations are 5% of the fixed prior's.
+        initial = math.log(math.expm1(0.05))
+        self.raw_scales = tuple(jnp.full_like(parameter, initial) for parameter in parameters)
+
+    def _prior_std(self, parameter):
+        # Shape-only prior: no learned values or labels determine its scale.
+        fan_in = math.prod(parameter.shape[1:]) if parameter.ndim > 1 else 1
+        return self.prior_scale / math.sqrt(fan_in)
+
+    def sample(self, key):
+        """Sample one network, reused across all examples and timesteps in a pass."""
+        parameters, static = eqx.partition(self.mean, eqx.is_inexact_array)
+        leaves, structure = jax.tree_util.tree_flatten(parameters)
+        keys = jax.random.split(key, len(leaves))
+        sampled = [
+            mean + self._prior_std(mean) * (jax.nn.softplus(raw_scale) + 1e-6)
+            * jax.random.normal(leaf_key, mean.shape, dtype=mean.dtype)
+            for mean, raw_scale, leaf_key in zip(leaves, self.raw_scales, keys)
+        ]
+        return eqx.combine(jax.tree_util.tree_unflatten(structure, sampled), static)
+
+    def kl_bits(self):
+        """Analytic KL(q || fixed zero-mean Gaussian prior), in bits, not file bytes."""
+        parameters = jax.tree_util.tree_leaves(eqx.filter(self.mean, eqx.is_inexact_array))
+        terms = []
+        for mean, raw_scale in zip(parameters, self.raw_scales):
+            ratio = jax.nn.softplus(raw_scale) + 1e-6
+            terms.append(jnp.sum(
+                (mean / self._prior_std(mean)) ** 2
+                + ratio**2 - 1 - 2 * jnp.log(ratio)
+            ))
+        return sum(terms) / (2 * math.log(2))
+
+
+@dataclass
+class InformationBudget:
+    """Monotonic, performance-gated budget; thresholds never follow degraded performance."""
+
+    bits: float
+    minimum: float
+    shrink_rate: float
+    patience: int
+    min_accuracy: float
+    max_loss: float
+    tolerance: float
+    qualifying_evaluations: int = 0
+    stage: int | None = None
+
+    def consider(self, *, kl_bits, accuracy, cross_entropy, stage):
+        """Hold the first evaluation of each curriculum stage, then require a streak."""
+        if stage != self.stage:
+            self.stage = stage
+            self.qualifying_evaluations = 0
+            return False
+        qualifies = (
+            all(math.isfinite(value) for value in (kl_bits, accuracy, cross_entropy))
+            and accuracy >= self.min_accuracy
+            and cross_entropy <= self.max_loss
+            and kl_bits <= (1 + self.tolerance) * self.bits
+        )
+        if not qualifies or self.bits <= self.minimum:
+            self.qualifying_evaluations = 0
+            return False
+        self.qualifying_evaluations += 1
+        if self.qualifying_evaluations < self.patience:
+            return False
+        self.bits = max(self.minimum, self.bits * (1 - self.shrink_rate))
+        self.qualifying_evaluations = 0
+        return True
 
 
 def batches(examples, sequence_length, batch_size, *, shuffle_seed=None):
@@ -46,15 +131,54 @@ def loss(
     return jnp.sum(losses * weights) / jnp.sum(weights)
 
 
+def _regularization_loss(model, weight_decay, weight_decay_type):
+    """Summed parameter penalty, including biases; L1 uses zero subgradient at zero."""
+    if weight_decay == 0:
+        return jnp.array(0.0)
+    parameters = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_inexact_array))
+    if weight_decay_type == "l1":
+        return weight_decay * sum(
+            jnp.sum(jnp.where(parameter == 0, 0, jnp.abs(parameter)))
+            for parameter in parameters
+        )
+    if weight_decay_type == "l2":
+        return 0.5 * weight_decay * sum(jnp.sum(parameter**2) for parameter in parameters)
+    raise ValueError("weight_decay_type must be l1 or l2")
+
+
 @eqx.filter_jit
-def train_step(model, state, batch, optimizer):
-    value, gradients = eqx.filter_value_and_grad(loss)(
-        model, batch["inputs"], batch["targets"], batch["mask"]
-    )
+def train_step(model, state, batch, optimizer, weight_decay, weight_decay_type):
+    def objective(model):
+        value = loss(model, batch["inputs"], batch["targets"], batch["mask"])
+        penalty = _regularization_loss(model, weight_decay, weight_decay_type)
+        return value + penalty, (value, penalty)
+
+    (_, (value, penalty)), gradients = eqx.filter_value_and_grad(objective, has_aux=True)(model)
     updates, state = optimizer.update(
         gradients, state, eqx.filter(model, eqx.is_inexact_array)
     )
-    return eqx.apply_updates(model, updates), state, value
+    return eqx.apply_updates(model, updates), state, value, penalty
+
+
+@eqx.filter_jit
+def information_train_step(posterior, state, batch, optimizer, key, budget, multiplier, dual_lr):
+    """Update posterior with a sampled likelihood, then ascend the projected KL dual."""
+    def objective(posterior):
+        sampled = posterior.sample(key)
+        value = loss(sampled, batch["inputs"], batch["targets"], batch["mask"])
+        constraint = multiplier * (posterior.kl_bits() / budget - 1)
+        return value + constraint, (value, constraint)
+
+    (_, (value, constraint)), gradients = eqx.filter_value_and_grad(objective, has_aux=True)(
+        posterior,
+    )
+    updates, state = optimizer.update(
+        gradients, state, eqx.filter(posterior, eqx.is_inexact_array),
+    )
+    posterior = eqx.apply_updates(posterior, updates)
+    kl_bits = posterior.kl_bits()
+    multiplier = jnp.maximum(0, multiplier + dual_lr * (kl_bits / budget - 1))
+    return posterior, state, value, constraint, multiplier, kl_bits
 
 
 @eqx.filter_jit
@@ -148,6 +272,19 @@ def evaluate(model, examples, data, batch_size):
     }
 
 
+def evaluate_posterior(posterior, examples, data, batch_size, keys):
+    """Mean sampled-network metrics plus worst-sample gates; not an ensemble decoder."""
+    metrics = [
+        evaluate(posterior.sample(key), examples, data, batch_size)
+        for key in keys
+    ]
+    return {
+        **{name: sum(row[name] for row in metrics) / len(metrics) for name in metrics[0]},
+        "min_exact_accuracy": min(row["exact_accuracy"] for row in metrics),
+        "max_loss": max(row["loss"] for row in metrics),
+    }
+
+
 def run_experiment(model: eqx.Module, data, args):
     """Train a deterministic causal Equinox model; keep data and splits shared.
 
@@ -157,7 +294,7 @@ def run_experiment(model: eqx.Module, data, args):
     seed, dataset size, operand range, operations, splits, thinking budgets, limit,
     schedule, and metrics.
 
-    Log untrained validation at epoch 0, then training/validation each epoch.
+    Log initial validation at epoch 0, then training/validation each epoch.
     Training shuffles with seed + epoch; evaluation order stays deterministic.
     Trackio logs locally; use distinct run names. Save final inference artifacts
     before test evaluation; optimizer state is not saved.
@@ -176,7 +313,7 @@ def run_experiment(model: eqx.Module, data, args):
         )
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(args.learning_rate, weight_decay=args.weight_decay),
+        optax.adam(args.learning_rate),
     )
     state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     config = {
@@ -209,7 +346,7 @@ def run_experiment(model: eqx.Module, data, args):
         config["name"] = run.name
         baseline = evaluate(model, data.validation, data, args.batch_size)
         trackio.log({"epoch": 0, **{f"validation/{k}": v for k, v in baseline.items()}})
-        print(f"Untrained validation: {baseline}", flush=True)
+        print(f"Initial validation: {baseline}", flush=True)
         for epoch in range(1, args.epochs + 1):
             train_examples = data.train
             curriculum_metrics = {}
@@ -228,6 +365,7 @@ def run_experiment(model: eqx.Module, data, args):
                 description += f" [stage {stage_index + 1}/{len(stages)}]"
             total_batches = (len(train_examples) + args.batch_size - 1) // args.batch_size
             weighted_loss = 0.0
+            weighted_penalty = 0.0
             token_count = 0
             with tqdm(
                 batches(
@@ -237,23 +375,35 @@ def run_experiment(model: eqx.Module, data, args):
                 total=total_batches, desc=description, unit="batch",
             ) as progress:
                 for batch in progress:
-                    model, state, value = train_step(model, state, batch, optimizer)
+                    model, state, value, penalty = train_step(
+                        model, state, batch, optimizer,
+                        args.weight_decay, args.weight_decay_type,
+                    )
                     count = int(np.sum(batch["mask"]))
                     weighted_loss += float(value) * count
+                    weighted_penalty += float(penalty) * count
                     token_count += count
-                    progress.set_postfix(loss=f"{weighted_loss / token_count:.4f}", refresh=False)
+                    progress.set_postfix(
+                        loss=f"{weighted_loss / token_count:.4f}",
+                        total=f"{(weighted_loss + weighted_penalty) / token_count:.4f}",
+                        refresh=False,
+                    )
             train_accuracy = _exact_accuracy(model, data.train, data, args.batch_size)
             validation = evaluate(model, data.validation, data, args.batch_size)
             train_loss = weighted_loss / token_count
+            train_penalty = weighted_penalty / token_count
             trackio.log({
                 "epoch": epoch,
                 "train/loss": train_loss,
+                "train/regularization_loss": train_penalty,
+                "train/total_loss": train_loss + train_penalty,
                 **curriculum_metrics,
                 **{f"train/{k}": v for k, v in train_accuracy.items()},
                 **{f"validation/{k}": v for k, v in validation.items()},
             })
             print(
                 f"Epoch {epoch:03d} | train loss {train_loss:.4f} | "
+                f"train total {train_loss + train_penalty:.4f} | "
                 f"train exact {train_accuracy['exact_accuracy']:.2%} | "
                 f"validation loss {validation['loss']:.4f} | "
                 f"validation exact {validation['exact_accuracy']:.2%}",
@@ -278,7 +428,11 @@ def run_experiment(model: eqx.Module, data, args):
 
 def parse_args():
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--model", choices=("rnn", "lstm"), default="rnn")
+    selector.add_argument("--model", choices=("rnn", "lstm"), default=None)
+    selector.add_argument(
+        "--init-from", default=None, metavar="ARTIFACT_DIR",
+        help="Start from saved config.json/model.eqx with a fresh optimizer",
+    )
     selection, _ = selector.parse_known_args()
     parser = argparse.ArgumentParser(description=__doc__, parents=[selector])
     parser.add_argument("--max-operand", type=int, default=19)
@@ -300,16 +454,16 @@ def parse_args():
         "--thinking-steps", type=int, nargs="+", default=DEFAULT_THINKING_STEPS,
         help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
     )
-    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--hidden-size", type=int, default=None, help="Hidden units (default: 128)")
     parser.add_argument(
-        "--num-layers", type=int, default=1,
+        "--num-layers", type=int, default=None,
         help="Number of stacked recurrent layers, each with hidden-size units (default: 1)",
     )
     parser.add_argument(
-        "--skip-connections", action="store_true",
+        "--skip-connections", action="store_true", default=None,
         help="Add residual connections around recurrent layers above the first",
     )
-    if selection.model == "lstm":
+    if selection.model == "lstm" or selection.init_from is not None:
         lstm_options = parser.add_argument_group("LSTM options")
         lstm_options.add_argument(
             "--embedding-size", type=int, default=None,
@@ -317,7 +471,7 @@ def parse_args():
         )
         bias_options = lstm_options.add_mutually_exclusive_group()
         bias_options.add_argument(
-            "--forget-bias", type=float, default=1.0,
+            "--forget-bias", type=float, default=None,
             help="Initial fixed forget-gate bias (default: 1); remains trainable",
         )
         bias_options.add_argument(
@@ -329,7 +483,11 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument(
         "--weight-decay", type=float, default=0.0,
-        help="AdamW decay for all trainable parameters, including biases (default: 0)",
+        help="L1/L2 loss coefficient for all trainable parameters, including biases (default: 0)",
+    )
+    parser.add_argument(
+        "--weight-decay-type", choices=("l1", "l2"), default="l2",
+        help="Penalty added to training loss: L1 sum(abs(w)) or L2 sum(w^2)/2 (default: l2)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--project", default="arithmetic")
@@ -339,19 +497,40 @@ def parse_args():
         help="Parent directory for unique run directories containing final weights and config",
     )
     args = parser.parse_args()
+    architecture_options = (
+        "model", "hidden_size", "num_layers", "skip_connections",
+        "embedding_size", "forget_bias", "chrono_max_timescale",
+    )
+    if args.init_from is not None:
+        overrides = [
+            "--" + option.replace("_", "-") for option in architecture_options
+            if getattr(args, option, None) is not None
+        ]
+        if overrides:
+            parser.error(
+                "--init-from uses the saved architecture; omit " + ", ".join(overrides)
+            )
+    else:
+        args.model = "rnn" if args.model is None else args.model
+        args.hidden_size = 128 if args.hidden_size is None else args.hidden_size
+        args.num_layers = 1 if args.num_layers is None else args.num_layers
+        args.skip_connections = False if args.skip_connections is None else args.skip_connections
     if args.operations is None:
         args.operations = "+" if args.curriculum == "addition" else "+-*"
     if args.curriculum == "addition" and args.operations != "+":
         parser.error("addition curriculum requires --operations +")
     if args.curriculum_stage_epochs < 1:
         parser.error("curriculum-stage-epochs must be positive")
-    if min(args.hidden_size, args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
-        parser.error("hidden-size, batch-size, epochs, and learning-rate must be positive")
-    if args.num_layers < 1:
-        parser.error("num-layers must be positive")
+    if min(args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
+        parser.error("batch-size, epochs, and learning-rate must be positive")
+    if args.init_from is None:
+        if args.hidden_size < 1 or args.num_layers < 1:
+            parser.error("hidden-size and num-layers must be positive")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error("weight-decay must be finite and nonnegative")
     if args.model == "lstm":
+        if args.forget_bias is None:
+            args.forget_bias = 1.0
         if args.embedding_size is None:
             args.embedding_size = args.hidden_size
         if args.embedding_size < 1:
@@ -367,23 +546,41 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.init_from is not None:
+        args.init_from = str(Path(args.init_from).expanduser().resolve())
+        try:
+            saved_config = json.loads((Path(args.init_from) / "config.json").read_text())
+            model_class = {"RNN": RNN, "LSTM": LSTM}.get(saved_config["architecture"])
+            if model_class is None:
+                raise ValueError(f"Unsupported artifact architecture: {saved_config['architecture']}")
+            model, _ = model_class.load_artifact(args.init_from)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise SystemExit(f"Could not load initial weights: {error}") from error
+        args.model = type(model).__name__.lower()
+        for option in ("hidden_size", "num_layers", "skip_connections"):
+            setattr(args, option, getattr(model, option))
+        if args.model == "lstm":
+            for option in ("embedding_size", "forget_bias", "chrono_max_timescale"):
+                setattr(args, option, getattr(model, option))
+        print(f"Loaded initial weights from {args.init_from}", flush=True)
+    else:
+        model_options = {
+            "hidden_size": args.hidden_size, "num_layers": args.num_layers,
+            "skip_connections": args.skip_connections,
+        }
+        if args.model == "lstm":
+            model_options.update(
+                embedding_size=args.embedding_size, forget_bias=args.forget_bias,
+                chrono_max_timescale=args.chrono_max_timescale,
+            )
+        model_class = {"rnn": RNN, "lstm": LSTM}[args.model]
+        model = model_class(len(VOCAB), **model_options, key=jax.random.key(args.seed))
     data = generate_data(
         max_operand=args.max_operand, operations=args.operations, seed=args.seed,
         completion_length=args.completion_length,
         dataset_size=args.dataset_size,
         thinking_steps=args.thinking_steps,
     )
-    model_options = {
-        "hidden_size": args.hidden_size, "num_layers": args.num_layers,
-        "skip_connections": args.skip_connections,
-    }
-    if args.model == "lstm":
-        model_options.update(
-            embedding_size=args.embedding_size, forget_bias=args.forget_bias,
-            chrono_max_timescale=args.chrono_max_timescale,
-        )
-    model_class = {"rnn": RNN, "lstm": LSTM}[args.model]
-    model = model_class(len(VOCAB), **model_options, key=jax.random.key(args.seed))
     run_experiment(model, data, args)
 
 

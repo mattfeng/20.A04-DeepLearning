@@ -187,12 +187,36 @@ embedding size may differ from hidden size; with one layer the flag is a no-op.
 Skips add no parameters and are disabled by default. Artifacts save the flag;
 older artifacts without it load with skips disabled.
 
-Both models support optional AdamW regularization with `--weight-decay 0.01`.
-The default is `0` (no decay, equivalent to the previous Adam optimizer); values
-must be finite and nonnegative. Decay applies to all trainable parameters,
-including biases and LSTM embeddings, separately from gradient clipping.
-Training and evaluation losses remain masked cross-entropy without an added
-regularization term. The decay setting is recorded in run and artifact config.
+Both models support optional loss regularization with `--weight-decay LAMBDA`
+and `--weight-decay-type l1|l2` (default `l2`):
+
+- L1 adds `LAMBDA * sum(abs(w))` to the training objective, with zero subgradient
+  at parameters equal to zero.
+- L2 adds `LAMBDA / 2 * sum(w**2)`, whose gradient contribution is `LAMBDA * w`.
+
+The coefficient defaults to `0` (disabled) and must be finite and nonnegative.
+The sums cover all trainable parameters, including biases and embeddings, without
+normalizing by parameter count. Larger models can therefore have larger penalties
+at the same coefficient. For example:
+
+```bash
+uv run math/experiment.py --model lstm --weight-decay 0.0001 --weight-decay-type l1
+uv run math/experiment.py --model rnn --weight-decay 0.0001 --weight-decay-type l2
+```
+
+The optimizer is Adam, with global-norm clipping applied to the combined
+cross-entropy and penalty gradients. This replaces the previous decoupled AdamW
+decay: **nonzero coefficients now have different optimization semantics**;
+L2 loss regularization with Adam is not equivalent to AdamW. Zero retains the
+unregularized Adam behavior. No separate optimizer decay is also applied.
+
+`train/loss` remains masked cross-entropy. Trackio additionally logs
+`train/regularization_loss` (the coefficient-scaled penalty) and
+`train/total_loss` (their sum). All three are token-weighted epoch averages of
+the batch values before each update, not measurements of final epoch weights.
+Validation/test losses remain cross-entropy only, and accuracy is unchanged.
+The coefficient and penalty type are recorded in run and artifact config;
+both can be changed when using `--init-from`.
 
 LSTM-only options include `--embedding-size` (defaults to hidden size) and
 two mutually exclusive forget-bias initializers:
@@ -248,6 +272,31 @@ uv run math/experiment.py --model lstm --max-operand 999 --dataset-size 10000 \
   state is not saved; existing RNN artifacts remain compatible.
 - Sampling, metric, and model-interface details live in the docstrings in
   [`math/data.py`](math/data.py) and [`math/experiment.py`](math/experiment.py).
+
+To train from an existing model, pass its artifact directory (containing both
+`config.json` and `model.eqx`):
+
+```bash
+uv run math/experiment.py --init-from artifacts/math/previous-run \
+    --epochs 50 --learning-rate 0.0001 --name continued-run
+```
+
+`--init-from` detects RNN/LSTM and restores its saved weights, layer count,
+hidden/embedding sizes, skip connections, and LSTM initialization metadata.
+Do not combine it with `--model`, `--hidden-size`, `--num-layers`,
+`--skip-connections`, `--embedding-size`, `--forget-bias`, or
+`--chrono-max-timescale`; these architecture/initialization overrides are rejected.
+Older artifacts use the model loaders' existing defaults for missing settings.
+
+This is a **weights-only warm start**, not an exact training resume: the optimizer
+is fresh, epoch numbering starts at zero for initial validation, and any curriculum
+starts at its first stage. `--epochs` specifies additional training epochs.
+Data, seed, learning rate, weight decay, curriculum, and other training settings
+come from the new command or its defaults, not the source run. Reuse the original
+data-generation arguments and seed to preserve its train/validation/test split;
+changing them can put previously trained equations into a new held-out split.
+The new run records the resolved `init_from` path and actual loaded architecture,
+and saves to a new run directory without overwriting the source artifact.
 
 Try a saved model interactively (use the run path printed after training):
 
