@@ -116,6 +116,7 @@ See [arithmetic experiments](#recurrent-neural-networks-rnns-lstms-grus) below.
 - What is a kernel convolution?
     - How blurs and filters work (Computerphile): https://www.youtube.com/watch?v=C_zFhWdM4ic
     - Sobel edge operator (Computerphile): https://www.youtube.com/watch?v=uihBwtPIBxM
+    - Gabor filters (shape and frequency): https://en.wikipedia.org/wiki/Gabor_filter
 - What is a convolutional neural network?
     - Convolutional neural networks (Computerphile): https://www.youtube.com/watch?v=py5byOOHZM8
 
@@ -147,13 +148,6 @@ uv run math/experiment.py --name vanilla-rnn-seed0
 uv run trackio show
 ```
 
-The generator pages each equation once, grouped by split, with thinking lengths
-listed at the top (`$PAGER` when set). Redirecting output disables interactive paging.
-Use `--sort equation` for numeric left operand, operator (`+`, `-`, `*`), then
-right operand order; `--sort operand-size` orders by the larger operand, then the
-smaller, ascending. Sorting stays within each split; default `--sort dataset`
-preserves the sampled order and never changes training data.
-
 Initial training run:
 
 ```bash
@@ -167,136 +161,13 @@ uv run math/experiment.py \
     --seed 0
 ```
 
-Each epoch shows a tqdm batch progress bar with ETA and running training loss.
-
-Choose `--model rnn` (default) or `--model lstm`; both accept `--hidden-size`
-and `--num-layers` (positive integer, default 1). All recurrent layers use the
-same hidden size. Layer 1 consumes token embeddings; each higher layer consumes
-the current output of the layer below. Only the top layer feeds the
-readout. Hidden state (and LSTM cell state) is independent per layer and resets
-for every equation. The Python constructors also accept `num_layers=N`.
-
-Artifacts record the layer count. Single-layer initialization and serialized
-array order are preserved; older artifacts without `num_layers` default to 1.
-
-Enable `--skip-connections` (Python: `skip_connections=True`) for residual
-connections around layers 2 through N: each layer forwards its input plus its
-new hidden output. The recurrent hidden state and LSTM cell state are not
-modified by the residual addition. There is no skip around layer 1, so LSTM
-embedding size may differ from hidden size; with one layer the flag is a no-op.
-Skips add no parameters and are disabled by default. Artifacts save the flag;
-older artifacts without it load with skips disabled.
-
-Both models support optional loss regularization with `--weight-decay LAMBDA`
-and `--weight-decay-type l1|l2` (default `l2`):
-
-- L1 adds `LAMBDA * sum(abs(w))` to the training objective, with zero subgradient
-  at parameters equal to zero.
-- L2 adds `LAMBDA / 2 * sum(w**2)`, whose gradient contribution is `LAMBDA * w`.
-
-The coefficient defaults to `0` (disabled) and must be finite and nonnegative.
-The sums cover all trainable parameters, including biases and embeddings, without
-normalizing by parameter count. Larger models can therefore have larger penalties
-at the same coefficient. For example:
-
-```bash
-uv run math/experiment.py --model lstm --weight-decay 0.0001 --weight-decay-type l1
-uv run math/experiment.py --model rnn --weight-decay 0.0001 --weight-decay-type l2
-```
-
-The optimizer is Adam, with global-norm clipping applied to the combined
-cross-entropy and penalty gradients. This replaces the previous decoupled AdamW
-decay: **nonzero coefficients now have different optimization semantics**;
-L2 loss regularization with Adam is not equivalent to AdamW. Zero retains the
-unregularized Adam behavior. No separate optimizer decay is also applied.
-
-`train/loss` remains masked cross-entropy. Trackio additionally logs
-`train/regularization_loss` (the coefficient-scaled penalty) and
-`train/total_loss` (their sum). All three are token-weighted epoch averages of
-the batch values before each update, not measurements of final epoch weights.
-Validation/test losses remain cross-entropy only, and accuracy is unchanged.
-The coefficient and penalty type are recorded in run and artifact config;
-both can be changed when using `--init-from`.
-
-LSTM-only options include `--embedding-size` (defaults to hidden size) and
-two mutually exclusive forget-bias initializers:
-
-- `--forget-bias B`: constant initial bias (default 1).
-- `--chrono-max-timescale T`: independently sample each unit's forget bias as
-  `log(U(1, T-1))`, with finite `T >= 2`. Choose `T` for the expected sequence
-  memory horizon; `T=2` gives zero forget biases. This overrides the default
-  constant initializer and is also available as `LSTM(..., chrono_max_timescale=T)`.
-
-Both initializers apply independently to every LSTM layer and leave the forget
-bias trainable. Chrono initialization changes only the forget gate, not the input
-gate; other parameter initialization
-is unchanged for the same seed. Artifacts record `T`, and older fixed-bias
-artifacts remain loadable.
-
-Use `--model lstm --help` to see its options:
-
-```bash
-uv run math/experiment.py --model lstm --max-operand 999 --dataset-size 10000 \
-    --hidden-size 128 --num-layers 3 --embedding-size 64 \
-    --chrono-max-timescale 32 --batch-size 128
-```
-
-- `--dataset-size` counts unique equations across all splits (default 120);
-  sampling balances operand digit lengths. Operands include 0 and `--max-operand`.
-- `--thinking-steps 0 1 2 4 8` (default on both CLIs) adds five `~`-prefix variants
-  per equation without consuming `--dataset-size`: 120 equations become 600 rows.
-  Variants stay in the same split. Use `--thinking-steps 0` for the no-thinking baseline.
-- `--operations` selects from `+`, `-`, `*`; `--completion-length` caps generation
-  (default 32). Use `--help` for all options and defaults. CPU is sufficient.
-- Prompt `12+7=` → completion `~~~~:19$` with four thinking steps. Training learns
-  `~`, delimiter, answer, and EOS; evaluation loss scores only answer/EOS across
-  variants. Exact accuracy decodes each unique equation once and ignores content
-  before the final answer. Trackio project: `arithmetic`.
-  After each epoch, both models log `train/exact_accuracy` to Trackio and print
-  it alongside training loss. This uses the epoch-end model and the same greedy
-  exact-answer scoring as validation, adding one decoding pass over unique
-  training equations. Training loss remains the token-weighted average recorded
-  during optimizer updates.
-  Training, validation, and test also log
-  `<split>/exact_accuracy/operand_lengths/<left_digits>x<right_digits>` using
-  the same predictions, with no extra decoding. For example, `7+12` belongs to
-  `1x2`, while `12+7` belongs to `2x1`; zero counts as one digit. Each bucket
-  combines all selected operators and counts unique equations, not thinking
-  variants. Buckets absent from a split are omitted, not reported as zero.
-  Overall exact accuracy remains equation-weighted, not an average of buckets.
-- Final weights (`model.eqx`) and run metadata (`config.json`) are saved under
-  `artifacts/math/<trackio-run-name>/` (override the parent with `--output-dir`).
-  Trackio generates the name unless `--name` is provided. Existing directories
-  are not overwritten. The runner calls `model.save_artifact(config, output_dir)`;
-  reload with `RNN.load_artifact(path)` or `LSTM.load_artifact(path)`. Optimizer
-  state is not saved; existing RNN artifacts remain compatible.
-- Sampling, metric, and model-interface details live in the docstrings in
-  [`math/data.py`](math/data.py) and [`math/experiment.py`](math/experiment.py).
-
 To train from an existing model, pass its artifact directory (containing both
-`config.json` and `model.eqx`):
+`config.json` and `model.eqx`).
 
 ```bash
 uv run math/experiment.py --init-from artifacts/math/previous-run \
     --epochs 50 --learning-rate 0.0001 --name continued-run
 ```
-
-`--init-from` detects RNN/LSTM and restores its saved weights, layer count,
-hidden/embedding sizes, skip connections, and LSTM initialization metadata.
-Do not combine it with `--model`, `--hidden-size`, `--num-layers`,
-`--skip-connections`, `--embedding-size`, `--forget-bias`, or
-`--chrono-max-timescale`; these architecture/initialization overrides are rejected.
-Older artifacts use the model loaders' existing defaults for missing settings.
-
-This is a **weights-only warm start**, not an exact training resume: the optimizer
-is fresh, epoch numbering starts at zero for initial validation, and any curriculum
-starts at its first stage. `--epochs` specifies additional training epochs.
-Data, seed, learning rate, weight decay, curriculum, and other training settings
-come from the new command or its defaults, not the source run. Reuse the original
-data-generation arguments and seed to preserve its train/validation/test split;
-changing them can put previously trained equations into a new held-out split.
-The new run records the resolved `init_from` path and actual loaded architecture,
-and saves to a new run directory without overwriting the source artifact.
 
 Try a saved model interactively (use the run path printed after training):
 
@@ -307,8 +178,6 @@ uv run math/repl.py artifacts/math/your-trackio-run-name
 The REPL detects the saved architecture automatically. Enter `12+7` or `3-9=`.
 It shows the raw completion, extracted answer, expected answer, and exact-match
 result. `:help` shows input syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
-
-LSTM behavioral checks: `uv run python -m unittest discover -s math -p test_lstm_model.py`.
 
 ### Addition curriculum
 
@@ -322,39 +191,6 @@ uv run math/experiment.py --model lstm --curriculum addition \
     --num-layers 3 --skip-connections --hidden-size 128 --embedding-size 64 \
     --curriculum-stage-epochs 5 --epochs 100 --seed 0
 ```
-
-The fixed training split is ranked by `(maximum operand digits, longest carry
-chain)`. A carry chain is a consecutive run of columns producing an outgoing
-carry, including a final overflow: `2+3` has no carry, `9+1` has a chain of one,
-and `99+1` has a chain of two. Stages progress through observed difficulty pairs
-in that order. Each stage retains **all earlier examples** for rehearsal,
-including their thinking variants. Thus a two-digit/no-carry stage still
-includes one-digit additions with carries. Empty difficulty groups are skipped;
-the final stage contains the entire original training split.
-
-`--curriculum-stage-epochs` defaults to 5. Each stage receives that many epochs;
-any remaining epochs continue on the final stage. A run must provide at least
-`number_of_stages * curriculum_stage_epochs` epochs, otherwise it fails before
-training. Stages do not reset parameters or optimizer state. Sequence length,
-generation budget, seeds, validation/test splits, and targets stay fixed.
-There is no new scratchpad target or vocabulary: this is an ordering curriculum,
-not an explicit implementation of addition inside the network.
-
-Trackio records `curriculum/stage`, `curriculum/max_digits`,
-`curriculum/max_carry_chain`, `curriculum/train_examples`, and
-`curriculum/train_equations`. Stage thresholds and sizes are also saved in run
-and artifact metadata. The carry threshold applies to the current maximum
-digit length; all shorter lengths remain included.
-
-Under curriculum training, `train/loss` covers only the active stage's examples,
-so its distribution changes at stage transitions. `train/exact_accuracy` and
-its operand-length breakdowns still cover the **full fixed training split**.
-Validation is unchanged and test evaluation still happens only after training.
-
-This ordering targets digit addition before longer carry propagation, but
-does not guarantee algorithmic generalization. The existing splits measure
-held-out equations within the configured operand range; they do not establish
-generalization to numbers longer than those seen in training.
 
 
 ## Attention and transformers
