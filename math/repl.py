@@ -1,6 +1,8 @@
-"""Interactively evaluate a saved arithmetic RNN using the experiment's scoring."""
+"""Interactively evaluate a saved arithmetic model using the experiment's scoring."""
 
 import argparse
+import json
+from pathlib import Path
 import re
 
 
@@ -56,10 +58,15 @@ def main():
 
     from data import OPERATIONS
     from experiment import extract_answer
+    from lstm_model import LSTM
     from rnn_model import RNN
 
     try:
-        model, config = RNN.load_artifact(args.artifact)
+        config = json.loads((Path(args.artifact) / "config.json").read_text())
+        model_class = {"RNN": RNN, "LSTM": LSTM}.get(config["architecture"])
+        if model_class is None:
+            raise ValueError(f"Unsupported artifact architecture: {config['architecture']}")
+        model, config = model_class.load_artifact(args.artifact)
     except (OSError, ValueError) as error:
         parser.exit(2, f"Could not load artifact: {error}\n")
     print(f"Loaded {args.artifact}")

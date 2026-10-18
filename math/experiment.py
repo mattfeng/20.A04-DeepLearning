@@ -1,6 +1,7 @@
 """Train and compare sequence models on a fixed arithmetic completion task."""
 
 import argparse
+import math
 
 import einops
 import equinox as eqx
@@ -11,11 +12,13 @@ import numpy as np
 import optax
 import trackio
 from jaxtyping import Array, Bool, Float, Int
+from tqdm import tqdm
 
 from data import (
     DEFAULT_THINKING_STEPS, EOS_ID, PAD_ID, VOCAB, Example, decode, encode,
     encode_example, generate_data,
 )
+from lstm_model import LSTM
 from rnn_model import RNN
 
 
@@ -162,17 +165,23 @@ def run_experiment(model: eqx.Module, data, args):
         baseline = evaluate(model, data.validation, data, args.batch_size)
         trackio.log({"epoch": 0, **{f"validation/{k}": v for k, v in baseline.items()}})
         print(f"Untrained validation: {baseline}", flush=True)
+        total_batches = (len(data.train) + args.batch_size - 1) // args.batch_size
         for epoch in range(1, args.epochs + 1):
             weighted_loss = 0.0
             token_count = 0
-            for batch in batches(
-                data.train, data.sequence_length, args.batch_size,
-                shuffle_seed=args.seed + epoch,
-            ):
-                model, state, value = train_step(model, state, batch, optimizer)
-                count = int(np.sum(batch["mask"]))
-                weighted_loss += float(value) * count
-                token_count += count
+            with tqdm(
+                batches(
+                    data.train, data.sequence_length, args.batch_size,
+                    shuffle_seed=args.seed + epoch,
+                ),
+                total=total_batches, desc=f"Epoch {epoch}/{args.epochs}", unit="batch",
+            ) as progress:
+                for batch in progress:
+                    model, state, value = train_step(model, state, batch, optimizer)
+                    count = int(np.sum(batch["mask"]))
+                    weighted_loss += float(value) * count
+                    token_count += count
+                    progress.set_postfix(loss=f"{weighted_loss / token_count:.4f}", refresh=False)
             validation = evaluate(model, data.validation, data, args.batch_size)
             train_loss = weighted_loss / token_count
             trackio.log({
@@ -204,7 +213,10 @@ def run_experiment(model: eqx.Module, data, args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--model", choices=("rnn", "lstm"), default="rnn")
+    selection, _ = selector.parse_known_args()
+    parser = argparse.ArgumentParser(description=__doc__, parents=[selector])
     parser.add_argument("--max-operand", type=int, default=19)
     parser.add_argument("--operations", default="+-*")
     parser.add_argument("--dataset-size", type=int, default=120)
@@ -214,6 +226,16 @@ def parse_args():
         help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
     )
     parser.add_argument("--hidden-size", type=int, default=128)
+    if selection.model == "lstm":
+        lstm_options = parser.add_argument_group("LSTM options")
+        lstm_options.add_argument(
+            "--embedding-size", type=int, default=None,
+            help="Token embedding dimension (default: hidden-size)",
+        )
+        lstm_options.add_argument(
+            "--forget-bias", type=float, default=1.0,
+            help="Initial forget-gate bias; trainable after initialization (default: 1)",
+        )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -227,6 +249,13 @@ def parse_args():
     args = parser.parse_args()
     if min(args.hidden_size, args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
         parser.error("hidden-size, batch-size, epochs, and learning-rate must be positive")
+    if args.model == "lstm":
+        if args.embedding_size is None:
+            args.embedding_size = args.hidden_size
+        if args.embedding_size < 1:
+            parser.error("embedding-size must be positive")
+        if not math.isfinite(args.forget_bias):
+            parser.error("forget-bias must be finite")
     return args
 
 
@@ -238,7 +267,11 @@ def main():
         dataset_size=args.dataset_size,
         thinking_steps=args.thinking_steps,
     )
-    model = RNN(len(VOCAB), args.hidden_size, key=jax.random.key(args.seed))
+    model_options = {"hidden_size": args.hidden_size}
+    if args.model == "lstm":
+        model_options.update(embedding_size=args.embedding_size, forget_bias=args.forget_bias)
+    model_class = {"rnn": RNN, "lstm": LSTM}[args.model]
+    model = model_class(len(VOCAB), **model_options, key=jax.random.key(args.seed))
     run_experiment(model, data, args)
 
 

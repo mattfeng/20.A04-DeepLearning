@@ -138,8 +138,8 @@ The values above are the defaults. `--channels` takes the output channel count f
 
 ## Recurrent neural networks: RNNs, LSTMs, GRUs
 
-`math/` compares causal sequence models on arithmetic completion, starting with
-a vanilla tanh RNN. From the repository root:
+`math/` compares a vanilla tanh RNN and a single-layer LSTM on arithmetic
+completion. From the repository root:
 
 ```bash
 uv run math/data.py --max-operand 19 --dataset-size 120 --seed 0
@@ -167,6 +167,18 @@ uv run math/experiment.py \
     --seed 0
 ```
 
+Each epoch shows a tqdm batch progress bar with ETA and running training loss.
+
+Choose `--model rnn` (default) or `--model lstm`; both accept `--hidden-size`.
+LSTM-only options are `--embedding-size` (defaults to hidden size) and
+`--forget-bias` (initial forget-gate bias, default 1; remains trainable).
+Use `--model lstm --help` to see its options:
+
+```bash
+uv run math/experiment.py --model lstm --max-operand 999 --dataset-size 10000 \
+    --hidden-size 128 --embedding-size 64 --forget-bias 1 --batch-size 128
+```
+
 - `--dataset-size` counts unique equations across all splits (default 120);
   sampling balances operand digit lengths. Operands include 0 and `--max-operand`.
 - `--thinking-steps 0 1 2 4 8` (default on both CLIs) adds five `~`-prefix variants
@@ -182,7 +194,8 @@ uv run math/experiment.py \
   `artifacts/math/<trackio-run-name>/` (override the parent with `--output-dir`).
   Trackio generates the name unless `--name` is provided. Existing directories
   are not overwritten. The runner calls `model.save_artifact(config, output_dir)`;
-  reload with `RNN.load_artifact(path)`. Optimizer state is not saved.
+  reload with `RNN.load_artifact(path)` or `LSTM.load_artifact(path)`. Optimizer
+  state is not saved; existing RNN artifacts remain compatible.
 - Sampling, metric, and model-interface details live in the docstrings in
   [`math/data.py`](math/data.py) and [`math/experiment.py`](math/experiment.py).
 
@@ -192,9 +205,11 @@ Try a saved model interactively (use the run path printed after training):
 uv run math/repl.py artifacts/math/your-trackio-run-name
 ```
 
-Enter equations such as `12+7` or `3-9=`. The REPL shows the raw completion,
-extracted answer, expected answer, and exact-match result. `:help` shows input
-syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
+The REPL detects the saved architecture automatically. Enter `12+7` or `3-9=`.
+It shows the raw completion, extracted answer, expected answer, and exact-match
+result. `:help` shows input syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
+
+LSTM behavioral checks: `uv run python -m unittest discover -s math -p test_lstm_model.py`.
 
 
 ## Attention and transformers

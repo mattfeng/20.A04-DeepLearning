@@ -32,19 +32,21 @@
 
 ## Instructions
 - Do not run builds or tests.
+- Do not create unit tests.
 - Do not verify work by running Python code, scripts, modules, CLIs, apps, or examples.
 - Do not try to add packages. Instead, tell the user what commands to run and confirm that they did so.
 
-# Deep Learning
+# Deep learning
 
 ## Experiment discipline
-- Treat model changes as experiments: state the hypothesis, the expected metric movement, and the comparison baseline before changing training code.
 - Keep data preprocessing, model architecture, loss functions, optimizer settings, and evaluation metrics explicit and reproducible.
 - Do not change random seeds, dataset splits, precision settings, or augmentation policy while also changing model logic unless the user asks for a broad experiment.
 - Preserve checkpoint compatibility unless the task explicitly requires a breaking architecture or state-dict change.
 
-## Training and evaluation
+## Correctness testing
 - Prefer small, fast smoke runs before long training jobs.
+
+## Training and evaluation
 - Report the exact command, config, dataset split, seed, hardware assumptions, and key metrics for any training or evaluation run.
 - Watch for silent failures: constant loss, NaNs/Infs, degenerate predictions, empty batches, train/eval mode mistakes, and metric leakage.
 - For performance work, distinguish data-loading bottlenecks, host/device transfer overhead, compilation time, and model compute time.
