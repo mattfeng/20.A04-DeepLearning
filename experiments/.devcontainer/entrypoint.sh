@@ -7,6 +7,7 @@ export HOME=/root SHELL=/bin/bash USER=root LOGNAME=root
 # Only image-owned executable directories participate in privileged startup.
 export PATH=/opt/uv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 /usr/bin/python3 -I /usr/local/lib/autoresearch/init-firewall.py
+/usr/bin/python3 -I /usr/local/lib/autoresearch/init-gpu.py
 
 # No capabilities survive into the command or any of its descendants.
 exec /usr/bin/setpriv \

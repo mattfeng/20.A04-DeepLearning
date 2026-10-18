@@ -15,8 +15,8 @@ from jaxtyping import Array, Bool, Float, Int
 from tqdm import tqdm
 
 from data import (
-    DEFAULT_THINKING_STEPS, EOS_ID, PAD_ID, VOCAB, Example, decode, encode,
-    encode_example, generate_data,
+    DEFAULT_THINKING_STEPS, EOS_ID, OPERATIONS, PAD_ID, VOCAB, Example, decode, encode,
+    addition_curriculum_stages, encode_example, generate_data,
 )
 from lstm_model import LSTM
 from rnn_model import RNN
@@ -105,6 +105,33 @@ def _unique_equations(examples):
     return tuple({example.prompt: example for example in examples}.values())
 
 
+def _exact_accuracy(model, examples, data, batch_size):
+    """Overall and operand-digit-pair accuracy, counting each unique equation once."""
+    correct = 0
+    group_counts = {}
+    equations = _unique_equations(examples)
+    for start in range(0, len(equations), batch_size):
+        subset = equations[start : start + batch_size]
+        prompts, lengths = completion_batch(subset, data.sequence_length)
+        predictions = np.asarray(complete(model, prompts, lengths, data.completion_length))
+        for example, prediction in zip(subset, predictions):
+            completion = "".join(VOCAB[int(token)] for token in prediction[len(example.prompt):])
+            is_correct = extract_answer(completion) == example.answer
+            correct += is_correct
+            op = next(op for op in OPERATIONS if op in example.prompt)
+            left, right = example.prompt[:-1].split(op)
+            group = (len(left), len(right))
+            group_correct, group_total = group_counts.get(group, (0, 0))
+            group_counts[group] = (group_correct + is_correct, group_total + 1)
+    return {
+        "exact_accuracy": correct / len(equations),
+        **{
+            f"exact_accuracy/operand_lengths/{left}x{right}": hits / total
+            for (left, right), (hits, total) in sorted(group_counts.items())
+        },
+    }
+
+
 def evaluate(model, examples, data, batch_size):
     """Answer/EOS loss across variants; greedy exact accuracy per unique equation."""
     weighted_loss = 0.0
@@ -115,16 +142,10 @@ def evaluate(model, examples, data, batch_size):
             loss(model, batch["inputs"], batch["targets"], batch["answer_mask"])
         ) * count
         token_count += count
-    correct = 0
-    equations = _unique_equations(examples)
-    for start in range(0, len(equations), batch_size):
-        subset = equations[start : start + batch_size]
-        prompts, lengths = completion_batch(subset, data.sequence_length)
-        predictions = np.asarray(complete(model, prompts, lengths, data.completion_length))
-        for example, prediction in zip(subset, predictions):
-            completion = "".join(VOCAB[int(token)] for token in prediction[len(example.prompt):])
-            correct += extract_answer(completion) == example.answer
-    return {"loss": weighted_loss / token_count, "exact_accuracy": correct / len(equations)}
+    return {
+        "loss": weighted_loss / token_count,
+        **_exact_accuracy(model, examples, data, batch_size),
+    }
 
 
 def run_experiment(model: eqx.Module, data, args):
@@ -140,8 +161,23 @@ def run_experiment(model: eqx.Module, data, args):
     Training shuffles with seed + epoch; evaluation order stays deterministic.
     Trackio logs locally; use distinct run names. Save final inference artifacts
     before test evaluation; optimizer state is not saved.
+    Curriculum stages select cumulative subsets of the fixed training split.
+    Training accuracy still covers the full training split at every epoch.
     """
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.learning_rate))
+    stages = (
+        addition_curriculum_stages(data.train)
+        if args.curriculum == "addition" else ()
+    )
+    if stages and args.epochs < len(stages) * args.curriculum_stage_epochs:
+        raise ValueError(
+            f"Addition curriculum has {len(stages)} stages and requires at least "
+            f"{len(stages) * args.curriculum_stage_epochs} epochs "
+            f"at {args.curriculum_stage_epochs} epochs per stage"
+        )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(args.learning_rate, weight_decay=args.weight_decay),
+    )
     state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
     config = {
         **vars(args),
@@ -158,6 +194,15 @@ def run_experiment(model: eqx.Module, data, args):
         "vocab": VOCAB,
         "gradient_clip_norm": 1.0,
         "backend": jax.default_backend(),
+        "curriculum_stages": [
+            {
+                "max_digits": stage.max_digits,
+                "max_carry_chain": stage.max_carry_chain,
+                "train_examples": len(stage.examples),
+                "train_equations": len(_unique_equations(stage.examples)),
+            }
+            for stage in stages
+        ],
     }
     run = trackio.init(project=args.project, name=args.name, config=config)
     try:
@@ -165,16 +210,31 @@ def run_experiment(model: eqx.Module, data, args):
         baseline = evaluate(model, data.validation, data, args.batch_size)
         trackio.log({"epoch": 0, **{f"validation/{k}": v for k, v in baseline.items()}})
         print(f"Untrained validation: {baseline}", flush=True)
-        total_batches = (len(data.train) + args.batch_size - 1) // args.batch_size
         for epoch in range(1, args.epochs + 1):
+            train_examples = data.train
+            curriculum_metrics = {}
+            description = f"Epoch {epoch}/{args.epochs}"
+            if stages:
+                stage_index = min(
+                    (epoch - 1) // args.curriculum_stage_epochs, len(stages) - 1,
+                )
+                stage = stages[stage_index]
+                train_examples = stage.examples
+                stage_config = config["curriculum_stages"][stage_index]
+                curriculum_metrics = {
+                    "curriculum/stage": stage_index + 1,
+                    **{f"curriculum/{key}": value for key, value in stage_config.items()},
+                }
+                description += f" [stage {stage_index + 1}/{len(stages)}]"
+            total_batches = (len(train_examples) + args.batch_size - 1) // args.batch_size
             weighted_loss = 0.0
             token_count = 0
             with tqdm(
                 batches(
-                    data.train, data.sequence_length, args.batch_size,
+                    train_examples, data.sequence_length, args.batch_size,
                     shuffle_seed=args.seed + epoch,
                 ),
-                total=total_batches, desc=f"Epoch {epoch}/{args.epochs}", unit="batch",
+                total=total_batches, desc=description, unit="batch",
             ) as progress:
                 for batch in progress:
                     model, state, value = train_step(model, state, batch, optimizer)
@@ -182,15 +242,19 @@ def run_experiment(model: eqx.Module, data, args):
                     weighted_loss += float(value) * count
                     token_count += count
                     progress.set_postfix(loss=f"{weighted_loss / token_count:.4f}", refresh=False)
+            train_accuracy = _exact_accuracy(model, data.train, data, args.batch_size)
             validation = evaluate(model, data.validation, data, args.batch_size)
             train_loss = weighted_loss / token_count
             trackio.log({
                 "epoch": epoch,
                 "train/loss": train_loss,
+                **curriculum_metrics,
+                **{f"train/{k}": v for k, v in train_accuracy.items()},
                 **{f"validation/{k}": v for k, v in validation.items()},
             })
             print(
                 f"Epoch {epoch:03d} | train loss {train_loss:.4f} | "
+                f"train exact {train_accuracy['exact_accuracy']:.2%} | "
                 f"validation loss {validation['loss']:.4f} | "
                 f"validation exact {validation['exact_accuracy']:.2%}",
                 flush=True,
@@ -218,7 +282,18 @@ def parse_args():
     selection, _ = selector.parse_known_args()
     parser = argparse.ArgumentParser(description=__doc__, parents=[selector])
     parser.add_argument("--max-operand", type=int, default=19)
-    parser.add_argument("--operations", default="+-*")
+    parser.add_argument(
+        "--operations", default=None,
+        help="Operators to sample (default: + for addition curriculum, otherwise +-*)",
+    )
+    parser.add_argument(
+        "--curriculum", choices=("none", "addition"), default="none",
+        help="Cumulative addition stages ordered by operand digits and carry-chain length",
+    )
+    parser.add_argument(
+        "--curriculum-stage-epochs", type=int, default=5,
+        help="Epochs per curriculum stage; remaining epochs use the final stage (default: 5)",
+    )
     parser.add_argument("--dataset-size", type=int, default=120)
     parser.add_argument("--completion-length", type=int, default=32)
     parser.add_argument(
@@ -226,19 +301,36 @@ def parse_args():
         help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
     )
     parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument(
+        "--num-layers", type=int, default=1,
+        help="Number of stacked recurrent layers, each with hidden-size units (default: 1)",
+    )
+    parser.add_argument(
+        "--skip-connections", action="store_true",
+        help="Add residual connections around recurrent layers above the first",
+    )
     if selection.model == "lstm":
         lstm_options = parser.add_argument_group("LSTM options")
         lstm_options.add_argument(
             "--embedding-size", type=int, default=None,
             help="Token embedding dimension (default: hidden-size)",
         )
-        lstm_options.add_argument(
+        bias_options = lstm_options.add_mutually_exclusive_group()
+        bias_options.add_argument(
             "--forget-bias", type=float, default=1.0,
-            help="Initial forget-gate bias; trainable after initialization (default: 1)",
+            help="Initial fixed forget-gate bias (default: 1); remains trainable",
+        )
+        bias_options.add_argument(
+            "--chrono-max-timescale", type=float, default=None,
+            help="Initialize forget biases as log(U(1, T-1)); finite T >= 2",
         )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--weight-decay", type=float, default=0.0,
+        help="AdamW decay for all trainable parameters, including biases (default: 0)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--project", default="arithmetic")
     parser.add_argument("--name", default=None)
@@ -247,8 +339,18 @@ def parse_args():
         help="Parent directory for unique run directories containing final weights and config",
     )
     args = parser.parse_args()
+    if args.operations is None:
+        args.operations = "+" if args.curriculum == "addition" else "+-*"
+    if args.curriculum == "addition" and args.operations != "+":
+        parser.error("addition curriculum requires --operations +")
+    if args.curriculum_stage_epochs < 1:
+        parser.error("curriculum-stage-epochs must be positive")
     if min(args.hidden_size, args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
         parser.error("hidden-size, batch-size, epochs, and learning-rate must be positive")
+    if args.num_layers < 1:
+        parser.error("num-layers must be positive")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("weight-decay must be finite and nonnegative")
     if args.model == "lstm":
         if args.embedding_size is None:
             args.embedding_size = args.hidden_size
@@ -256,6 +358,10 @@ def parse_args():
             parser.error("embedding-size must be positive")
         if not math.isfinite(args.forget_bias):
             parser.error("forget-bias must be finite")
+        if args.chrono_max_timescale is not None and (
+            not math.isfinite(args.chrono_max_timescale) or args.chrono_max_timescale < 2
+        ):
+            parser.error("chrono-max-timescale must be finite and at least 2")
     return args
 
 
@@ -267,9 +373,15 @@ def main():
         dataset_size=args.dataset_size,
         thinking_steps=args.thinking_steps,
     )
-    model_options = {"hidden_size": args.hidden_size}
+    model_options = {
+        "hidden_size": args.hidden_size, "num_layers": args.num_layers,
+        "skip_connections": args.skip_connections,
+    }
     if args.model == "lstm":
-        model_options.update(embedding_size=args.embedding_size, forget_bias=args.forget_bias)
+        model_options.update(
+            embedding_size=args.embedding_size, forget_bias=args.forget_bias,
+            chrono_max_timescale=args.chrono_max_timescale,
+        )
     model_class = {"rnn": RNN, "lstm": LSTM}[args.model]
     model = model_class(len(VOCAB), **model_options, key=jax.random.key(args.seed))
     run_experiment(model, data, args)

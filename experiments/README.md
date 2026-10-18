@@ -19,7 +19,7 @@ open a new terminal. Existing terminal sessions retain their running shell.
 
 Regeneration removes obsolete `run-pi.sh`, `experiments/run.sh`,
 `.pi/extensions/research-tools.ts`, and `.pi/extensions/experiments.ts` only
-with `--force`. Review local edits before forcing removal. Symlinks at these
+with overwrite confirmation or `--force`. Review local edits first. Symlinks at these
 paths are rejected even with `--force`; remove them yourself after review.
 Run `pi` directly from the container workspace directory.
 
@@ -66,9 +66,8 @@ choices. To change active choices, edit `~/.pi/agent/settings.json` or use Pi's
 extension or project settings.
 
 There is no generated project `.pi/settings.json`. Regeneration removes the old
-file automatically only if it matches the old generated defaults. If modified,
-review it and migrate desired choices to node's settings before using `--force`
-to remove it.
+file. Modified settings require confirmation or `--force`; review the old file and
+migrate desired choices to node's settings before removal.
 
 ## Filesystem contract
 
@@ -89,13 +88,13 @@ preserved; Trackio is not installed by this generator.
 | Resolved host source | Relative to this workspace | Container target |
 |---|---|---|
 
-| `/Users/mattfeng/20.A04-DeepLearning/README.md` | `../README.md` | `/project/README.md` |
+| `/home/mattfeng/20.A04-DeepLearning/README.md` | `../README.md` | `/project/README.md` |
 
-| `/Users/mattfeng/20.A04-DeepLearning/math` | `../math` | `/project/math` |
+| `/home/mattfeng/20.A04-DeepLearning/math` | `../math` | `/project/math` |
 
-| `/Users/mattfeng/20.A04-DeepLearning/pyproject.toml` | `../pyproject.toml` | `/project/pyproject.toml` |
+| `/home/mattfeng/20.A04-DeepLearning/pyproject.toml` | `../pyproject.toml` | `/project/pyproject.toml` |
 
-| `/Users/mattfeng/20.A04-DeepLearning/uv.lock` | `../uv.lock` | `/project/uv.lock` |
+| `/home/mattfeng/20.A04-DeepLearning/uv.lock` | `../uv.lock` | `/project/uv.lock` |
 
 
 
@@ -104,7 +103,8 @@ sources; a selected directory exposes all descendants. Selecting sources outside
 the workspace's parent can shift the common ancestor used for target paths.
 The root-owned `/project` scaffolding is not a writable work area.
 
-Selections are saved as portable workspace-relative paths in `.autoresearch.json`.
+Source selections are saved as portable workspace-relative paths in `read_only`
+and the boolean GPU choice as `gpus` in `.autoresearch.json`.
 Rerun `configure-autoresearch --workspace /path/to/this-folder` on the host to
 browse from this workspace with saved choices prechecked. Use `ls`, `up`,
 `cd NAME/INDEX/PATH`, `toggle INDEX/PATH`, `select .`, and `selected`; review
@@ -118,12 +118,25 @@ existing choices. Number lists must contain no spaces; repeats and overlaps
 count once, and invalid batches do not change any selections.
 
 Alternatively, pass repeatable `--read-only PATH` choices (relative to the
-workspace, overriding saved choices), or `--non-interactive` to reuse saved
-configuration. Without explicit choices, non-interactive setup requires saved
-configuration. No writes occur until successful generation; `--dry-run` never
-writes files or settings. Changed generated files require `--force` to replace.
-The obsolete runner and extension files listed above require reviewed `--force`
-removal; commands now run through Pi's built-in Bash tool.
+workspace, overriding saved choices) to skip only the source picker.
+Interactive setup also asks **“Give the devcontainer access to all NVIDIA GPUs?”**
+with a yes/no choice, defaulting to the saved choice, or off for new/older
+settings without `gpus`. `--read-only` alone still prompts for GPU access.
+`--gpus` enables access and `--no-gpus` disables it; either skips the GPU prompt.
+
+`--non-interactive` skips all prompts and reuses saved configuration, including
+the GPU choice (missing `gpus` means false). It requires saved configuration
+unless explicit `--read-only` choices are supplied; with explicit source choices
+and no saved configuration, GPU access defaults off. `--gpus` or `--no-gpus`
+overrides the saved/default GPU choice in either mode.
+
+Cancellation or EOF before generation writes nothing. No writes occur until
+successful generation; `--dry-run` never writes files or settings. After source
+and GPU choices, interactive setup lists changed files and obsolete files and
+asks before overwriting/removing them (default: no). Declining or EOF writes nothing.
+`--force` skips confirmation; non-interactive updates still require `--force`.
+Interactive `--dry-run` previews changes without asking for overwrite permission.
+Commands run through Pi's built-in Bash tool.
 
 The supplied workspace must be new, empty, or an existing autoresearch directory.
 Setup checks this before opening the picker and again before generating files.
@@ -148,6 +161,41 @@ against its host's kernel or a privileged Docker socket; no Docker socket is mou
 Only root startup receives the capabilities needed to install the firewall and
 drop to `node`; Pi and experiments run without capabilities or sudo.
 The container allocates 1 GiB to `/dev/shm` via `--shm-size=1g`.
+
+### NVIDIA GPU access
+
+
+**Selected GPU access: enabled.** This devcontainer includes Docker's
+`--gpus=all` runtime argument to expose all available NVIDIA GPUs.
+
+
+This option is Linux/Docker NVIDIA GPU passthrough, not Apple Metal or macOS GPU
+support. The Docker host needs compatible NVIDIA GPUs, drivers, and the NVIDIA
+Container Toolkit. Setup does not detect GPUs or install drivers, the toolkit,
+or CUDA. Scientific workloads may also need user-provided CUDA-enabled runtime
+dependencies in the Dockerfile or Python environment.
+
+Before dropping privileges, root startup detects the numeric GIDs of top-level
+NVIDIA character devices where group membership grants additional read or write
+access. It adds `node` to those groups, including read-only or write-only groups.
+This survives `setpriv --init-groups` and applies to new VS Code terminals;
+no host-specific GID is hardcoded. Device modes and capability restrictions
+remain unchanged. Regenerate, rebuild, and recreate older containers to apply
+this permission fix.
+
+To change the selection, rerun setup on the host with `--gpus` or `--no-gpus`
+(confirm replacements after reviewing local edits, or use `--force`), then recreate
+the devcontainer to apply the changed runtime arguments. Restarting the existing
+container is not enough.
+
+
+After creating or recreating the container, optionally run `nvidia-smi` inside it
+to inspect GPU visibility:
+
+```bash
+nvidia-smi
+```
+
 
 ## First run
 
@@ -243,7 +291,8 @@ container replacement or `/tmp` cleanup. For standalone creation, use
 `UV_CACHE_DIR` remains under `/workspace/experiments/results/.cache/uv`.
 To match complex scientific dependencies, modify the Pi
 Dockerfile or base it on the same runtime image as your development container.
-GPU access is not enabled; configure it deliberately if required.
+For GPU workloads, supply compatible CUDA-enabled scientific dependencies as
+needed; GPU passthrough alone does not install them.
 
 ## Outbound firewall
 
@@ -309,7 +358,7 @@ domain security or prevent exfiltration through allowed destinations.
   not redact sensitive files; broadly selected directories expose descendants.
 - The image uses a conventional writable container layer for system temporary
   files. The entire workspace is writable back to the project host.
-- Generated file updates are intentional: regenerate with `--force` only after
-  reviewing changes; this replaces generated files.
+- Generated file updates are intentional: review local edits before confirming
+  overwrite or using `--force`; this replaces generated files.
 
 Reference: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import operator
 import random
+import re
 
 import numpy as np
 from jaxtyping import Bool, Int
@@ -32,6 +33,64 @@ class Example:
     @property
     def completion(self) -> str:
         return "~" * self.thinking_steps + ":" + self.answer + "$"
+
+
+@dataclass(frozen=True)
+class AdditionStage:
+    max_digits: int
+    max_carry_chain: int
+    examples: tuple[Example, ...]
+
+
+def addition_curriculum_stages(
+    examples: tuple[Example, ...],
+) -> tuple[AdditionStage, ...]:
+    """Build cumulative addition stages from the supplied training examples.
+
+    Difficulty is (maximum operand digit count, longest consecutive outgoing
+    carry chain), ordered lexicographically. Stage thresholds therefore retain
+    all shorter operand lengths, even when their carry chains are longer.
+    Only observed difficulty keys produce stages. Zero has one digit, and a
+    carry out of the most significant operand column counts toward the chain.
+
+    Preserve input order and every thinking variant within each stage, without
+    duplicating samples. Only prompts are inspected; answers are not used.
+    Raise ValueError for empty input or prompts other than nonnegative integer
+    addition in the form "a+b=".
+    """
+    examples = tuple(examples)
+    if not examples:
+        raise ValueError("addition curriculum requires nonempty examples")
+
+    prompt_keys: dict[str, tuple[int, int]] = {}
+    keys = []
+    for example in examples:
+        if example.prompt not in prompt_keys:
+            match = re.fullmatch(r"([0-9]+)\+([0-9]+)=", example.prompt)
+            if match is None:
+                raise ValueError(
+                    f"addition curriculum requires addition prompts: {example.prompt!r}"
+                )
+            left, right = (operand.lstrip("0") or "0" for operand in match.groups())
+            digits = max(len(left), len(right))
+            carry = run = longest = 0
+            for a, b in zip(reversed(left.zfill(digits)), reversed(right.zfill(digits))):
+                carry = (int(a) + int(b) + carry) // 10
+                run = run + 1 if carry else 0
+                longest = max(longest, run)
+            prompt_keys[example.prompt] = (digits, longest)
+        keys.append(prompt_keys[example.prompt])
+
+    return tuple(
+        AdditionStage(
+            max_digits=threshold[0],
+            max_carry_chain=threshold[1],
+            examples=tuple(
+                example for example, key in zip(examples, keys) if key <= threshold
+            ),
+        )
+        for threshold in sorted(set(keys))
+    )
 
 
 @dataclass(frozen=True)

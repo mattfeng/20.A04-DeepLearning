@@ -31,7 +31,7 @@
 
     "source=${localWorkspaceFolder}/../uv.lock,target=/project/uv.lock,type=bind,readonly",
 
-    "source=autoresearch-pi-079347924e,target=/home/node/.pi,type=volume"
+    "source=autoresearch-pi-7fa35eeea8,target=/home/node/.pi,type=volume"
   ],
   "containerEnv": {
     "PYTHONPATH": "/project:/project/src",
@@ -45,6 +45,9 @@
     "UV_PROJECT_ENVIRONMENT": "/tmp/experiments/.venv"
   },
   "runArgs": [
+
+    "--gpus=all",
+
     "--shm-size=1g",
     "--cap-drop=ALL",
     "--cap-add=NET_ADMIN",

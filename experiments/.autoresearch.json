@@ -4,5 +4,6 @@
     "../math",
     "../pyproject.toml",
     "../uv.lock"
-  ]
+  ],
+  "gpus": true
 }

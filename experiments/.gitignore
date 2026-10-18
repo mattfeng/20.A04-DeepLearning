@@ -1,7 +1,7 @@
 # Experiment artifacts: tracked only by exception.
 /results/*
 !/results/.gitkeep
+trackio/
 __pycache__/
 .pytest_cache/
 .venv/
-trackio/

@@ -1,6 +1,7 @@
-"""A single-layer LSTM exposing token-sequence -> causal next-token logits."""
+"""A stacked LSTM exposing token-sequence -> causal next-token logits."""
 
 import json
+import math
 from pathlib import Path
 
 import equinox as eqx
@@ -13,35 +14,64 @@ from data import VOCAB
 
 class LSTM(eqx.Module):
     embedding: eqx.nn.Embedding
-    input_projection: eqx.nn.Linear
-    recurrent_projection: eqx.nn.Linear
+    input_projections: tuple[eqx.nn.Linear, ...]
+    recurrent_projections: tuple[eqx.nn.Linear, ...]
     readout: eqx.nn.Linear
     hidden_size: int = eqx.field(static=True)
     embedding_size: int = eqx.field(static=True)
     forget_bias: float = eqx.field(static=True)
+    chrono_max_timescale: float | None = eqx.field(static=True)
+    num_layers: int = eqx.field(static=True)
+    skip_connections: bool = eqx.field(static=True)
 
     def __init__(
         self, vocab_size: int, hidden_size: int = 128, *,
         embedding_size: int | None = None, forget_bias: float = 1.0,
-        key: PRNGKeyArray,
+        chrono_max_timescale: float | None = None,
+        num_layers: int = 1, skip_connections: bool = False, key: PRNGKeyArray,
     ):
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError("num_layers must be a positive integer")
+        if chrono_max_timescale is not None and (
+            not math.isfinite(chrono_max_timescale) or chrono_max_timescale < 2
+        ):
+            raise ValueError("chrono_max_timescale must be finite and at least 2")
         embedding_key, input_key, recurrent_key, output_key = jax.random.split(key, 4)
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.skip_connections = skip_connections
         self.embedding_size = hidden_size if embedding_size is None else embedding_size
         self.forget_bias = forget_bias
+        self.chrono_max_timescale = chrono_max_timescale
         self.embedding = eqx.nn.Embedding(vocab_size, self.embedding_size, key=embedding_key)
-        self.input_projection = eqx.nn.Linear(
-            self.embedding_size, 4 * hidden_size, key=input_key,
-        )
-        self.recurrent_projection = eqx.nn.Linear(
-            hidden_size, 4 * hidden_size, use_bias=False, key=recurrent_key,
-        )
-        # Gate order is input, forget, candidate, output. This is an initialization
-        # value only; the forget bias remains trainable as part of the projection.
-        bias = self.input_projection.bias.at[hidden_size:2 * hidden_size].set(forget_bias)
-        self.input_projection = eqx.tree_at(
-            lambda layer: layer.bias, self.input_projection, bias,
-        )
+        input_projections = []
+        recurrent_projections = []
+        for layer in range(num_layers):
+            layer_key = key if layer == 0 else jax.random.fold_in(key, layer + 4)
+            if layer:
+                input_key, recurrent_key = jax.random.split(layer_key)
+            input_projection = eqx.nn.Linear(
+                self.embedding_size if layer == 0 else hidden_size,
+                4 * hidden_size, key=input_key,
+            )
+            recurrent_projections.append(eqx.nn.Linear(
+                hidden_size, 4 * hidden_size, use_bias=False, key=recurrent_key,
+            ))
+            # Gate order: input, forget, candidate, output. Only forget biases
+            # get this initializer; all biases remain trainable.
+            layer_forget_bias = forget_bias
+            if chrono_max_timescale is not None:
+                bias_key = jax.random.fold_in(layer_key, 4)
+                layer_forget_bias = jnp.log(jax.random.uniform(
+                    bias_key, (hidden_size,), dtype=input_projection.bias.dtype,
+                    minval=1.0, maxval=chrono_max_timescale - 1.0,
+                ))
+            bias = input_projection.bias.at[hidden_size:2 * hidden_size].set(layer_forget_bias)
+            input_projections.append(eqx.tree_at(
+                lambda projection: projection.bias, input_projection, bias,
+            ))
+        self.input_projections = tuple(input_projections)
+        self.recurrent_projections = tuple(recurrent_projections)
         self.readout = eqx.nn.Linear(hidden_size, vocab_size, key=output_key)
 
     def save_artifact(self, config: dict, output_dir: str | Path) -> Path:
@@ -56,8 +86,11 @@ class LSTM(eqx.Module):
             "architecture": type(self).__name__,
             "model_config": {
                 "hidden_size": self.hidden_size,
+                "num_layers": self.num_layers,
+                "skip_connections": self.skip_connections,
                 "embedding_size": self.embedding_size,
                 "forget_bias": self.forget_bias,
+                "chrono_max_timescale": self.chrono_max_timescale,
             },
             "vocab": VOCAB,
         }
@@ -80,20 +113,30 @@ class LSTM(eqx.Module):
         return eqx.tree_deserialise_leaves(directory / "model.eqx", model), config
 
     def __call__(self, tokens: Int[Array, "time"]) -> Float[Array, "time vocab"]:
-        """Return causal logits, resetting hidden and cell state for each equation."""
+        """Return causal logits, resetting hidden and cell state for each equation.
+
+        Optional skips add each upper layer's input to its output, leaving
+        recurrent hidden/cell states unchanged. The first layer has no skip,
+        so its embedding dimension may differ from the hidden dimension.
+        """
         inputs = jax.vmap(self.embedding)(tokens)
 
         def step(state, inputs):
-            hidden, cell = state
-            gates = self.input_projection(inputs) + self.recurrent_projection(hidden)
-            input_gate, forget_gate, candidate, output_gate = jnp.split(gates, 4)
-            cell = (
-                jax.nn.sigmoid(forget_gate) * cell
-                + jax.nn.sigmoid(input_gate) * jnp.tanh(candidate)
-            )
-            hidden = jax.nn.sigmoid(output_gate) * jnp.tanh(cell)
-            return (hidden, cell), self.readout(hidden)
+            next_state = []
+            for layer, ((hidden, cell), input_projection, recurrent_projection) in enumerate(zip(
+                state, self.input_projections, self.recurrent_projections,
+            )):
+                gates = input_projection(inputs) + recurrent_projection(hidden)
+                input_gate, forget_gate, candidate, output_gate = jnp.split(gates, 4)
+                cell = (
+                    jax.nn.sigmoid(forget_gate) * cell
+                    + jax.nn.sigmoid(input_gate) * jnp.tanh(candidate)
+                )
+                hidden = jax.nn.sigmoid(output_gate) * jnp.tanh(cell)
+                next_state.append((hidden, cell))
+                inputs = inputs + hidden if self.skip_connections and layer > 0 else hidden
+            return tuple(next_state), self.readout(inputs)
 
         zeros = jnp.zeros(self.hidden_size, dtype=inputs.dtype)
-        _, logits = jax.lax.scan(step, (zeros, zeros), inputs)
+        _, logits = jax.lax.scan(step, ((zeros, zeros),) * self.num_layers, inputs)
         return logits

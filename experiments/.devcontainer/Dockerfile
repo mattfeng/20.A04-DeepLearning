@@ -4,7 +4,7 @@ FROM node:24-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git python3 python3-venv python3-pip ripgrep jq bash \
-    fd-find zsh iptables util-linux \
+    fd-find zsh iptables util-linux htop \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && usermod --shell /bin/zsh node \
     && rm -rf /var/lib/apt/lists/*
@@ -34,7 +34,7 @@ USER root
 ENV HOME=/root SHELL=/bin/bash
 
 # Startup policy, node helper, and Pi defaults are immutable to the agent.
-COPY --chown=0:0 init-firewall.py firewall-allowlist.txt entrypoint.sh init-node.py pi-settings.json /usr/local/lib/autoresearch/
+COPY --chown=0:0 init-firewall.py init-gpu.py firewall-allowlist.txt entrypoint.sh init-node.py pi-settings.json /usr/local/lib/autoresearch/
 RUN chmod 0755 /usr/local/lib/autoresearch \
     && chmod 0444 /usr/local/lib/autoresearch/*
 
