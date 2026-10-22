@@ -119,6 +119,7 @@ See [arithmetic experiments](#recurrent-neural-networks-rnns-lstms-grus) below.
     - Gabor filters (shape and frequency): https://en.wikipedia.org/wiki/Gabor_filter
 - What is a convolutional neural network?
     - Convolutional neural networks (Computerphile): https://www.youtube.com/watch?v=py5byOOHZM8
+- Transformer circuits for CNNs: https://distill.pub/2020/circuits/zoom-in/
 
 ### Experiment
 
@@ -138,6 +139,13 @@ The values above are the defaults. `--channels` takes the output channel count f
 
 
 ## Recurrent neural networks: RNNs, LSTMs, GRUs
+
+### Background
+
+- Most AI has amnesia. Here's the fix (Artem Kirsanov): https://www.youtube.com/watch?v=PAoe7mmmvp0
+- RNN architectures: https://inductive-research.github.io/blog/arch
+
+### Experiment
 
 `math/` compares a vanilla tanh RNN and an LSTM, both supporting stacked layers,
 on arithmetic completion. From the repository root:
