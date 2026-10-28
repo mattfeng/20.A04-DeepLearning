@@ -156,6 +156,11 @@ uv run math/experiment.py --name vanilla-rnn-seed0
 uv run trackio show
 ```
 
+In `math/experiment.py`, `create_model` handles initialization or artifact loading,
+`train_epoch` performs one pass over the training split, and `run_experiment`
+coordinates evaluation, logging, and saving. `main` connects model setup, data
+generation, and the run. The REPL shares its decoding and answer-scoring helpers.
+
 Initial training run:
 
 ```bash
@@ -187,17 +192,16 @@ The REPL detects the saved architecture automatically. Enter `12+7` or `3-9=`.
 It shows the raw completion, extracted answer, expected answer, and exact-match
 result. `:help` shows input syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
 
-### Addition curriculum
+### Addition-only training
 
-Both models support `--curriculum addition`. This defaults `--operations` to `+`
-and rejects other operators. Without a curriculum, the existing `+-*` default
-and full-training-split schedule are unchanged.
+Both models train on the full training split every epoch. The default operations
+are `+-*`; pass `--operations +` to train on addition only.
 
 ```bash
-uv run math/experiment.py --model lstm --curriculum addition \
+uv run math/experiment.py --model lstm --operations + \
     --max-operand 999 --dataset-size 10000 --thinking-steps 0 \
     --num-layers 3 --skip-connections --hidden-size 128 --embedding-size 64 \
-    --curriculum-stage-epochs 5 --epochs 100 --seed 0
+    --epochs 100 --seed 0
 ```
 
 
