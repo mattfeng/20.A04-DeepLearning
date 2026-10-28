@@ -1,9 +1,12 @@
 """Train and compare sequence models on a fixed arithmetic completion task."""
 
 import argparse
+from collections.abc import Callable
 import json
 import math
 from pathlib import Path
+import shlex
+from typing import Any
 
 import einops
 import equinox as eqx
@@ -271,107 +274,181 @@ def run_experiment(model: eqx.Module, data, args):
     return model
 
 
-def parse_args():
-    selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--model", choices=("rnn", "lstm"), default=None)
-    selector.add_argument(
-        "--init-from", default=None, metavar="ARTIFACT_DIR",
-        help="Start from saved config.json/model.eqx with a fresh optimizer",
-    )
-    selection, _ = selector.parse_known_args()
-    parser = argparse.ArgumentParser(description=__doc__, parents=[selector])
-    parser.add_argument("--max-operand", type=int, default=19)
-    parser.add_argument(
-        "--operations", default="+-*",
-        help="Operators to sample (default: +-*)",
-    )
-    parser.add_argument("--dataset-size", type=int, default=120)
-    parser.add_argument("--completion-length", type=int, default=32)
-    parser.add_argument(
-        "--thinking-steps", type=int, nargs="+", default=DEFAULT_THINKING_STEPS,
-        help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
-    )
-    parser.add_argument("--hidden-size", type=int, default=None, help="Hidden units (default: 128)")
-    parser.add_argument(
-        "--num-layers", type=int, default=None,
-        help="Number of stacked recurrent layers, each with hidden-size units (default: 1)",
-    )
-    parser.add_argument(
-        "--skip-connections", action="store_true", default=None,
-        help="Add residual connections around recurrent layers above the first",
-    )
-    if selection.model == "lstm" or selection.init_from is not None:
-        lstm_options = parser.add_argument_group("LSTM options")
-        lstm_options.add_argument(
-            "--embedding-size", type=int, default=None,
-            help="Token embedding dimension (default: hidden-size)",
-        )
-        bias_options = lstm_options.add_mutually_exclusive_group()
-        bias_options.add_argument(
-            "--forget-bias", type=float, default=None,
-            help="Initial fixed forget-gate bias (default: 1); remains trainable",
-        )
-        bias_options.add_argument(
-            "--chrono-max-timescale", type=float, default=None,
-            help="Initialize forget biases as log(U(1, T-1)); finite T >= 2",
-        )
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument(
-        "--weight-decay", type=float, default=0.0,
-        help="L1/L2 loss coefficient for all trainable parameters, including biases (default: 0)",
-    )
-    parser.add_argument(
-        "--weight-decay-type", choices=("l1", "l2"), default="l2",
-        help="Penalty added to training loss: L1 sum(abs(w)) or L2 sum(w^2)/2 (default: l2)",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--project", default="arithmetic")
-    parser.add_argument("--name", default=None)
-    parser.add_argument(
-        "--output-dir", default="artifacts/math",
-        help="Parent directory for unique run directories containing final weights and config",
-    )
-    args = parser.parse_args()
-    architecture_options = (
-        "model", "hidden_size", "num_layers", "skip_connections",
-        "embedding_size", "forget_bias", "chrono_max_timescale",
-    )
-    if args.init_from is not None:
-        overrides = [
-            "--" + option.replace("_", "-") for option in architecture_options
-            if getattr(args, option, None) is not None
-        ]
-        if overrides:
-            parser.error(
-                "--init-from uses the saved architecture; omit " + ", ".join(overrides)
-            )
+def _thinking_steps(text: str) -> list[int]:
+    steps = [int(step) for step in text.split(",")]
+    if (
+        any(step < 0 for step in steps)
+        or any(left >= right for left, right in zip(steps, steps[1:]))
+    ):
+        raise ValueError("use comma-separated increasing nonnegative integers, e.g. 0,1,2,4")
+    return steps
+
+
+def _prompt(
+    option, default, convert: Callable[[str], Any] = str, *,
+    optional=False, minimum=None, positive=False, choices=(),
+):
+    label = option.replace("_", " ").capitalize()
+    if choices:
+        label += " (" + "/".join(choices) + ")"
+    if convert is bool:
+        label += " (yes/no)"
+    if default is None:
+        shown = "none"
+    elif isinstance(default, bool):
+        shown = "yes" if default else "no"
+    elif isinstance(default, (tuple, list)):
+        shown = ",".join(map(str, default))
     else:
-        args.model = "rnn" if args.model is None else args.model
-        args.hidden_size = 128 if args.hidden_size is None else args.hidden_size
-        args.num_layers = 1 if args.num_layers is None else args.num_layers
-        args.skip_connections = False if args.skip_connections is None else args.skip_connections
-    if min(args.batch_size, args.epochs) < 1 or args.learning_rate <= 0:
-        parser.error("batch-size, epochs, and learning-rate must be positive")
-    if args.init_from is None:
-        if args.hidden_size < 1 or args.num_layers < 1:
-            parser.error("hidden-size and num-layers must be positive")
-    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
-        parser.error("weight-decay must be finite and nonnegative")
-    if args.model == "lstm":
-        if args.forget_bias is None:
-            args.forget_bias = 1.0
-        if args.embedding_size is None:
-            args.embedding_size = args.hidden_size
-        if args.embedding_size < 1:
-            parser.error("embedding-size must be positive")
-        if not math.isfinite(args.forget_bias):
-            parser.error("forget-bias must be finite")
-        if args.chrono_max_timescale is not None and (
-            not math.isfinite(args.chrono_max_timescale) or args.chrono_max_timescale < 2
-        ):
-            parser.error("chrono-max-timescale must be finite and at least 2")
+        shown = str(default)
+    while True:
+        text = input(f"{label} [{shown}]: ").strip()
+        if not text:
+            text = shown
+        if optional and text.lower() == "none":
+            return None
+        try:
+            if convert is bool:
+                value = {"yes": True, "true": True, "no": False, "false": False}[text.lower()]
+            else:
+                value = convert(text)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError("must be finite")
+            if positive and value <= 0:
+                raise ValueError("must be positive")
+            if minimum is not None and value < minimum:
+                raise ValueError(f"must be at least {minimum}")
+            if choices and value not in choices:
+                raise ValueError("choose " + ", ".join(choices))
+            if convert is str and not value:
+                raise ValueError("must not be empty")
+        except (ValueError, KeyError) as error:
+            print(f"Invalid {option}: {error}. Please try again.")
+        else:
+            return value
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--model-config", metavar="'KEY=VALUE ...'",
+        help="Model prompt defaults, e.g. 'model=lstm hidden-size=128 num-layers=3'",
+    )
+    parser.add_argument(
+        "--experiment-config", metavar="'KEY=VALUE ...'",
+        help="Data/training/run prompt defaults, e.g. 'operations=+ epochs=50 seed=0'",
+    )
+    cli = parser.parse_args()
+    model_defaults = {
+        "init_from": None,
+        "model": "rnn",
+        "hidden_size": 128,
+        "num_layers": 1,
+        "skip_connections": False,
+        "embedding_size": None,
+        "forget_bias": 1.0,
+        "chrono_max_timescale": None,
+    }
+    experiment_defaults = {
+        "max_operand": 19,
+        "operations": "+-*",
+        "dataset_size": 120,
+        "completion_length": 32,
+        "thinking_steps": DEFAULT_THINKING_STEPS,
+        "batch_size": 64,
+        "epochs": 100,
+        "learning_rate": 1e-3,
+        "weight_decay": 0.0,
+        "weight_decay_type": "l2",
+        "seed": 0,
+        "project": "arithmetic",
+        "name": None,
+        "output_dir": "artifacts/math",
+    }
+
+    def configure(flag, options):
+        config = {}
+        text = getattr(cli, flag)
+        if text is not None:
+            try:
+                entries = shlex.split(text)
+            except ValueError as error:
+                parser.error(f"could not read --{flag.replace('_', '-')}: {error}")
+            for entry in entries:
+                key, separator, value = entry.partition("=")
+                option = key.replace("-", "_")
+                if not separator or option not in options:
+                    parser.error(
+                        f"expected a known key=value option for --{flag.replace('_', '-')}, "
+                        f"got {entry!r}"
+                    )
+                config[option] = value
+            options.update(config)
+        return config
+
+    model_config = configure("model_config", model_defaults)
+    configure("experiment_config", experiment_defaults)
+    if all(
+        model_config.get(option, "none").lower() != "none"
+        for option in ("forget_bias", "chrono_max_timescale")
+    ):
+        parser.error("forget-bias and chrono-max-timescale are mutually exclusive")
+    defaults = {**model_defaults, **experiment_defaults}
+    args = argparse.Namespace()
+
+    def ask(option, convert: Callable[[str], Any] = str, **kwargs):
+        value = _prompt(option, defaults[option], convert, **kwargs)
+        setattr(args, option, value)
+        return value
+
+    print("Customize the experiment. Enter keeps [default]; none clears optional values.")
+    try:
+        print("\nModel configuration")
+        ask("init_from", optional=True)
+        if args.init_from is not None:
+            architecture_options = {
+                "model", "hidden_size", "num_layers", "skip_connections",
+                "embedding_size", "forget_bias", "chrono_max_timescale",
+            }
+            overrides = architecture_options & model_config.keys()
+            if overrides:
+                parser.error(
+                    "init_from uses the saved architecture; omit "
+                    + ", ".join(sorted(overrides))
+                )
+            print("Using the saved architecture; only data and training settings are editable.")
+        else:
+            ask("model", choices=("rnn", "lstm"))
+            ask("hidden_size", int, minimum=1)
+            ask("num_layers", int, minimum=1)
+            ask("skip_connections", bool)
+            if args.model == "lstm":
+                if defaults["embedding_size"] is None:
+                    defaults["embedding_size"] = args.hidden_size
+                ask("embedding_size", int, minimum=1)
+                ask("chrono_max_timescale", float, optional=True, minimum=2)
+                if args.chrono_max_timescale is None:
+                    ask("forget_bias", float)
+                else:
+                    args.forget_bias = 1.0
+        print("\nData configuration")
+        ask("max_operand", int, minimum=1)
+        ask("operations")
+        ask("dataset_size", int, minimum=10)
+        ask("completion_length", int, minimum=1)
+        ask("thinking_steps", _thinking_steps)
+        print("\nTraining and run configuration")
+        ask("batch_size", int, minimum=1)
+        ask("epochs", int, minimum=1)
+        ask("learning_rate", float, positive=True)
+        ask("weight_decay", float, minimum=0)
+        ask("weight_decay_type", choices=("l1", "l2"))
+        ask("seed", int)
+        ask("project")
+        ask("name", optional=True)
+        ask("output_dir")
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\nConfiguration cancelled; no training started.") from None
     return args
 
 

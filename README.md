@@ -152,7 +152,7 @@ on arithmetic completion. From the repository root:
 
 ```bash
 uv run math/data.py --max-operand 19 --dataset-size 120 --seed 0
-uv run math/experiment.py --name vanilla-rnn-seed0
+uv run math/experiment.py
 uv run trackio show
 ```
 
@@ -161,25 +161,44 @@ In `math/experiment.py`, `create_model` handles initialization or artifact loadi
 coordinates evaluation, logging, and saving. `main` connects model setup, data
 generation, and the run. The REPL shares its decoding and answer-scoring helpers.
 
+The experiment prompts separately for model, data, and training/run settings.
+Press Enter to keep the displayed default, or type a replacement. Use `yes`/`no`
+for booleans, comma-separated integers for thinking steps (for example `0,1,2,4`),
+and `none` to clear an optional artifact path, chrono timescale, or run name.
+Ctrl-D or Ctrl-C cancels configuration before training starts.
+
+Two optional flags supply prompt defaults using space-separated `key=value` pairs,
+not JSON. Every applicable setting is still prompted, including supplied values.
+Quote values containing spaces inside the config string, for example
+`--experiment-config 'name="my run" epochs=50'`.
+
+| Flag | Available settings |
+| --- | --- |
+| `--model-config` | `model` (`rnn`/`lstm`), `init-from`, `hidden-size`, `num-layers`, `skip-connections`; LSTM-only: `embedding-size`, `forget-bias`, `chrono-max-timescale` |
+| `--experiment-config` | Data: `max-operand`, `operations`, `dataset-size`, `completion-length`, `thinking-steps`. Training/run: `batch-size`, `epochs`, `learning-rate`, `weight-decay`, `weight-decay-type`, `seed`, `project`, `name`, `output-dir` |
+
+Keys must belong to the specified group. LSTM prompts appear only when selecting
+an LSTM; embedding size defaults to the chosen hidden size. Chrono initialization
+and a fixed forget bias are mutually exclusive; the forget-bias prompt appears
+only when chrono timescale is `none`. Individual per-setting CLI flags are removed.
+
 Initial training run:
 
 ```bash
 uv run math/experiment.py \
-    --max-operand 999 \
-    --dataset-size 10000 \
-    --hidden-size 128 \
-    --batch-size 128 \
-    --epochs 100 \
-    --learning-rate 0.001 \
-    --seed 0
+    --model-config 'hidden-size=128' \
+    --experiment-config 'max-operand=999 dataset-size=10000 batch-size=128'
 ```
 
 To train from an existing model, pass its artifact directory (containing both
-`config.json` and `model.eqx`).
+`config.json` and `model.eqx`). Its architecture remains fixed; only data and
+training/run settings are prompted. Omit architecture keys from `--model-config`
+when using `init-from`. This starts a fresh optimizer, not a resumed optimizer.
 
 ```bash
-uv run math/experiment.py --init-from artifacts/math/previous-run \
-    --epochs 50 --learning-rate 0.0001 --name continued-run
+uv run math/experiment.py \
+    --model-config 'init-from=artifacts/math/previous-run' \
+    --experiment-config 'epochs=50 learning-rate=0.0001 name=continued-run'
 ```
 
 Try a saved model interactively (use the run path printed after training):
@@ -195,13 +214,12 @@ result. `:help` shows input syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
 ### Addition-only training
 
 Both models train on the full training split every epoch. The default operations
-are `+-*`; pass `--operations +` to train on addition only.
+are `+-*`; set `operations=+` in `--experiment-config` or at the prompt to train on addition only.
 
 ```bash
-uv run math/experiment.py --model lstm --operations + \
-    --max-operand 999 --dataset-size 10000 --thinking-steps 0 \
-    --num-layers 3 --skip-connections --hidden-size 128 --embedding-size 64 \
-    --epochs 100 --seed 0
+uv run math/experiment.py \
+    --model-config 'model=lstm num-layers=3 skip-connections=yes hidden-size=128 embedding-size=64' \
+    --experiment-config 'operations=+ max-operand=999 dataset-size=10000 thinking-steps=0'
 ```
 
 
