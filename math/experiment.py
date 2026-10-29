@@ -2,6 +2,7 @@
 
 import argparse
 from collections.abc import Callable
+from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -20,7 +21,7 @@ from tqdm import tqdm
 
 from config import parse_config, thinking_steps
 from data import (
-    DATA_DEFAULTS, EOS_ID, PAD_ID, VOCAB, Example, decode, encode,
+    DATA_DEFAULTS, EOS_ID, PAD_ID, VOCAB, ArithmeticData, Example, decode, encode,
     encode_example, generate_data,
 )
 from lstm_model import LSTM
@@ -208,16 +209,23 @@ def train_epoch(model, state, optimizer, data, args, epoch):
 
 
 def run_experiment(model: eqx.Module, data, args):
-    """Log baseline, train/evaluate each epoch, save weights, then evaluate test.
+    """Train, saving the last completed epoch on normal completion or Ctrl-C.
 
-    Training shuffles with seed + epoch; evaluation order stays deterministic.
-    Artifacts contain final inference weights and config, not optimizer state.
+    Checkpoints include optimizer state and the exact dataset. Full resume uses
+    absolute epoch numbers so training shuffles still use seed + epoch.
     """
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(args.learning_rate),
     )
     state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+    if args.resume:
+        try:
+            state = eqx.tree_deserialise_leaves(Path(args.init_from) / "optimizer.eqx", state)
+        except (OSError, ValueError, TypeError, EOFError) as error:
+            raise SystemExit(f"Could not restore optimizer state: {error}") from error
+    checkpoint = (args.start_epoch, (model, state, {}))
+    interrupted = False
     config = {
         **vars(args),
         "architecture": type(model).__name__,
@@ -237,28 +245,44 @@ def run_experiment(model: eqx.Module, data, args):
     run = trackio.init(project=args.project, name=args.name, config=config)
     try:
         config["name"] = run.name
-        baseline = evaluate(model, data.validation, data, args.batch_size)
-        trackio.log({"epoch": 0, **{f"validation/{k}": v for k, v in baseline.items()}})
-        print(f"Initial validation: {baseline}", flush=True)
-        for epoch in range(1, args.epochs + 1):
-            model, state, train = train_epoch(model, state, optimizer, data, args, epoch)
-            train.update(_exact_accuracy(model, data.train, data, args.batch_size))
-            validation = evaluate(model, data.validation, data, args.batch_size)
+        try:
+            baseline = evaluate(model, data.validation, data, args.batch_size)
             trackio.log({
-                "epoch": epoch,
-                **{f"train/{k}": v for k, v in train.items()},
-                **{f"validation/{k}": v for k, v in validation.items()},
+                "epoch": args.start_epoch,
+                **{f"validation/{k}": v for k, v in baseline.items()},
             })
-            print(
-                f"Epoch {epoch:03d} | train loss {train['loss']:.4f} | "
-                f"train total {train['total_loss']:.4f} | "
-                f"train exact {train['exact_accuracy']:.2%} | "
-                f"validation loss {validation['loss']:.4f} | "
-                f"validation exact {validation['exact_accuracy']:.2%}",
-                flush=True,
-            )
+            print(f"Initial validation: {baseline}", flush=True)
+            for epoch in range(args.start_epoch + 1, args.epochs + 1):
+                # Commit model and optimizer together only after a full epoch.
+                # An interrupted train_epoch leaves this tuple unchanged.
+                checkpoint = (epoch, train_epoch(model, state, optimizer, data, args, epoch))
+                _, (model, state, train) = checkpoint
+                train.update(_exact_accuracy(model, data.train, data, args.batch_size))
+                validation = evaluate(model, data.validation, data, args.batch_size)
+                trackio.log({
+                    "epoch": epoch,
+                    **{f"train/{k}": v for k, v in train.items()},
+                    **{f"validation/{k}": v for k, v in validation.items()},
+                })
+                print(
+                    f"Epoch {epoch:03d} | train loss {train['loss']:.4f} | "
+                    f"train total {train['total_loss']:.4f} | "
+                    f"train exact {train['exact_accuracy']:.2%} | "
+                    f"validation loss {validation['loss']:.4f} | "
+                    f"validation exact {validation['exact_accuracy']:.2%}",
+                    flush=True,
+                )
+        except KeyboardInterrupt:
+            interrupted = True
+            print(f"\nTraining interrupted; saving completed epoch {checkpoint[0]}.", flush=True)
+        completed_epoch, (model, state, _) = checkpoint
+        config.update(completed_epoch=completed_epoch, interrupted=interrupted)
         directory = model.save_artifact(config, args.output_dir)
+        eqx.tree_serialise_leaves(directory / "optimizer.eqx", state)
+        (directory / "data.json").write_text(json.dumps(asdict(data)) + "\n")
         print(f"Saved model artifact: {directory}", flush=True)
+        if interrupted:
+            return model
         # Test labels are evaluated only after the fixed training schedule.
         test = evaluate(model, data.test, data, args.batch_size)
         trackio.log({f"test/{k}": v for k, v in test.items()})
@@ -345,6 +369,7 @@ def parse_args():
         "feedforward_size": None,
     }
     experiment_defaults = {
+        "resume": False,
         "batch_size": 64,
         "epochs": 100,
         "learning_rate": 1e-3,
@@ -371,7 +396,7 @@ def parse_args():
         **data_defaults,
         **experiment_defaults, **experiment_config,
     }
-    args = argparse.Namespace()
+    args = argparse.Namespace(start_epoch=0)
 
     def ask(option, convert: Callable[[str], Any] = str, **kwargs):
         value = _prompt(option, defaults[option], convert, **kwargs)
@@ -382,6 +407,12 @@ def parse_args():
     try:
         print("\nModel configuration")
         ask("init_from", optional=True)
+        if args.init_from is None:
+            args.resume = False
+            if str(defaults["resume"]).lower() not in ("no", "false"):
+                parser.error("resume requires init-from in --model-config")
+        else:
+            ask("resume", bool)
         if args.init_from is not None:
             architecture_options = {
                 "model", "hidden_size", "num_layers", "skip_connections",
@@ -394,7 +425,7 @@ def parse_args():
                     "init_from uses the saved architecture; omit "
                     + ", ".join(sorted(overrides))
                 )
-            print("Using the saved architecture; only data and training settings are editable.")
+            print("Using the saved architecture.")
         else:
             ask("model", choices=("rnn", "lstm", "transformer"))
             ask("hidden_size", int, minimum=1)
@@ -415,19 +446,55 @@ def parse_args():
                     defaults["embedding_size"] = args.hidden_size
                 ask("embedding_size", int, minimum=1)
                 ask("chrono_max_timescale", float, minimum=2)
-        print("\nData configuration")
-        ask("max_operand", int, minimum=1)
-        ask("dataset_size", int, minimum=10)
-        ask("completion_length", int, minimum=1)
-        ask("thinking_steps", thinking_steps)
-        ask("data_seed", int)
+        training_options = (
+            "batch_size", "learning_rate", "weight_decay", "weight_decay_type", "seed",
+        )
+        if args.resume:
+            if data_config or experiment_config.keys() & set(training_options):
+                parser.error(
+                    "resume=yes restores data and optimizer settings; omit --data-config "
+                    "and batch-size, learning-rate, weight-decay, weight-decay-type, seed "
+                    "from --experiment-config, or use resume=no for fresh data/optimizer"
+                )
+            directory = Path(args.init_from).expanduser()
+            try:
+                saved = json.loads((directory / "config.json").read_text())
+                if not all((directory / name).is_file() for name in ("optimizer.eqx", "data.json")):
+                    raise ValueError("checkpoint needs optimizer.eqx and data.json")
+                args.start_epoch = saved["completed_epoch"]
+                for option in (
+                    "max_operand", "dataset_size", "completion_length", "thinking_steps",
+                    "data_seed", *training_options,
+                ):
+                    setattr(args, option, saved[option])
+                defaults["epochs"] = max(saved["epochs"], args.start_epoch + 1)
+                if "epochs" in experiment_config:
+                    defaults["epochs"] = experiment_config["epochs"]
+                for option in ("project", "output_dir"):
+                    if option not in experiment_config:
+                        defaults[option] = saved[option]
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                parser.error(f"could not resume checkpoint: {error}; use resume=no for weights only")
+            print(
+                f"Restoring dataset and optimizer from completed epoch {args.start_epoch}; "
+                "epochs is the total target epoch number."
+            )
+        else:
+            print("\nData configuration")
+            ask("max_operand", int, minimum=1)
+            ask("dataset_size", int, minimum=10)
+            ask("completion_length", int, minimum=1)
+            ask("thinking_steps", thinking_steps)
+            ask("data_seed", int)
         print("\nTraining and run configuration")
-        ask("batch_size", int, minimum=1)
-        ask("epochs", int, minimum=1)
-        ask("learning_rate", float, positive=True)
-        ask("weight_decay", float, minimum=0)
-        ask("weight_decay_type", choices=("l1", "l2"))
-        ask("seed", int)
+        if not args.resume:
+            ask("batch_size", int, minimum=1)
+        ask("epochs", int, minimum=args.start_epoch + 1)
+        if not args.resume:
+            ask("learning_rate", float, positive=True)
+            ask("weight_decay", float, minimum=0)
+            ask("weight_decay_type", choices=("l1", "l2"))
+            ask("seed", int)
         ask("project")
         ask("name", optional=True)
         ask("output_dir")
@@ -485,12 +552,22 @@ def create_model(args):
 def main():
     args = parse_args()
     model = create_model(args)
-    data = generate_data(
-        max_operand=args.max_operand, seed=args.data_seed,
-        completion_length=args.completion_length,
-        dataset_size=args.dataset_size,
-        thinking_steps=args.thinking_steps,
-    )
+    if args.resume:
+        try:
+            saved_data = json.loads((Path(args.init_from) / "data.json").read_text())
+            for split in ("train", "validation", "test"):
+                saved_data[split] = tuple(Example(**example) for example in saved_data[split])
+            saved_data["thinking_steps"] = tuple(saved_data["thinking_steps"])
+            data = ArithmeticData(**saved_data)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise SystemExit(f"Could not restore checkpoint dataset: {error}") from error
+    else:
+        data = generate_data(
+            max_operand=args.max_operand, seed=args.data_seed,
+            completion_length=args.completion_length,
+            dataset_size=args.dataset_size,
+            thinking_steps=args.thinking_steps,
+        )
     run_experiment(model, data, args)
 
 

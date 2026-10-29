@@ -214,8 +214,9 @@ These settings apply to RNN, LSTM, and Transformer runs alike. Pass data setting
 
 | Setting | Valid values | Default | Description |
 | --- | --- | --- | --- |
+| `resume` | `yes`, `no` (also `true`, `false`; case-insensitive) | `no` | Prompted only when `init-from` is set. Use `yes` to restore the checkpoint's dataset, optimizer state, training settings, and completed epoch, or `no` to load weights only with configurable data and a fresh optimizer. |
 | `batch-size` | Integer ≥ `1` | `64` | Examples per batch. |
-| `epochs` | Integer ≥ `1` | `100` | Full passes over the training split. |
+| `epochs` | Integer ≥ `1`; greater than the completed epoch when resuming | `100` | Target epoch number. Fresh or weights-only training starts at epoch `1`; full resume continues through this target rather than adding this many epochs. |
 | `learning-rate` | Finite real number > `0` | `0.001` | Adam learning rate; scientific notation such as `1e-3` is accepted. |
 | `weight-decay` | Finite real number ≥ `0` | `0.0` | Parameter-penalty coefficient; `0` disables the penalty. |
 | `weight-decay-type` | `l1`, `l2` | `l2` | Parameter-penalty type. |
@@ -234,13 +235,32 @@ uv run math/data.py \
 
 #### Training from an artifact
 
-To train from an existing model, pass its artifact directory (containing both `config.json` and `model.eqx`). Its architecture remains fixed; only data and training/run settings are prompted. Omit architecture keys from `--model-config` when using `init-from`. Saved weights are restored without reinitialization. This starts a fresh optimizer, not a resumed optimizer. The vocabulary and token IDs remain unchanged for checkpoint compatibility.
+To train from an existing model, pass its artifact directory (containing both `config.json` and `model.eqx`). Its architecture remains fixed. Omit architecture keys from `--model-config` when using `init-from`. With `resume=no` (the default), saved weights are restored without reinitialization, data and training/run settings remain configurable, and training starts at epoch `1` with a fresh optimizer. The vocabulary and token IDs remain unchanged for checkpoint compatibility.
 
 ```bash
 uv run math/experiment.py \
     --model-config 'init-from=artifacts/math/previous-run' \
-    --experiment-config 'epochs=50 learning-rate=0.0001 name=continued-run'
+    --data-config 'max-operand=999 dataset-size=10000 seed=7' \
+    --experiment-config 'resume=no epochs=50 learning-rate=0.0001 name=continued-run'
 ```
+
+#### Interrupting and resuming training
+
+Press Ctrl-C once during training to save the last fully completed training epoch. Updates from an unfinished epoch are discarded; if no epoch has finished, the initial state is saved as epoch `0`. Interruption during the per-epoch metrics also saves that epoch's completed training updates. The artifact path is printed before exit, Trackio is closed, and test evaluation is skipped for interrupted runs. This handles Ctrl-C, not forced termination such as `kill -9`.
+
+Both completed and interrupted runs save `model.eqx`, `config.json`, `optimizer.eqx`, and `data.json`. The checkpoint includes Adam's moments and step counter, the exact ordered train/validation/test examples and thinking variants, data settings, training settings, and `completed_epoch`. It remains usable by the REPL and weights-only `init-from` training.
+
+To restore the full training state, set `resume=yes` alongside `init-from`:
+
+```bash
+uv run math/experiment.py \
+    --model-config 'init-from=artifacts/math/interrupted-run' \
+    --experiment-config 'resume=yes epochs=100 name=resumed-run'
+```
+
+Full resume restores the dataset directly from `data.json`, rather than regenerating or resplitting it, and restores the optimizer using the saved learning rate, regularization settings, batch size, and training seed. Training continues at `completed_epoch + 1`, using the original epoch-based shuffle schedule. For example, a checkpoint at epoch `12` with `epochs=100` runs epochs `13` through `100`. The prompted epoch default is the original target, or the next epoch if that target has already been reached.
+
+When `resume=yes`, omit `--data-config` and do not supply `batch-size`, `learning-rate`, `weight-decay`, `weight-decay-type`, or `seed` in `--experiment-config`; these settings are restored and are not prompted. You can change the target `epochs`, Trackio `project`, new run `name`, and `output-dir`. A resumed run writes a new artifact directory and does not overwrite its source checkpoint. Older artifacts without optimizer and dataset files support weights-only loading with `resume=no`, but not full resume.
 
 #### Interactive evaluation
 
