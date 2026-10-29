@@ -222,8 +222,8 @@ These settings apply to RNN, LSTM, and Transformer runs alike. Pass data setting
 | `weight-decay-type` | `l1`, `l2` | `l2` | Parameter-penalty type. |
 | `seed` | Integer | `0` | Random seed for model initialization and training shuffles. Does not change the dataset. |
 | `project` | Nonempty string | `arithmetic` | Trackio project name. |
-| `name` | `none` or a nonempty run name usable as a single directory name (not `.` or `..`) | `none` | Trackio run name and artifact subdirectory; `none` lets Trackio choose. |
-| `output-dir` | Nonempty directory path | `artifacts/math` | Artifact root; the run subdirectory must not already exist. |
+| `name` | `none` or a nonempty run name usable as a single directory name (not `.` or `..`) | `none` | Trackio run name and artifact subdirectory; `none` chooses a name automatically. |
+| `output-dir` | Nonempty directory path | `artifacts/math` | Artifact root; existing run directories are preserved, with name collisions resolved before training. |
 
 The dataset viewer accepts the same `--data-config` string as the experiment command. Additionally, you can control viewer ordering via the `--sort` flag. For example, to inspect equations ordered by operand size:
 

@@ -6,6 +6,8 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import Path
+import secrets
+from string import ascii_lowercase
 from typing import Any
 
 import einops
@@ -208,12 +210,53 @@ def train_epoch(model, state, optimizer, data, args, epoch):
     }
 
 
+def _choose_run_name(project: str, output_dir: str, requested: str | None) -> str:
+    """Choose an unused Trackio/artifact name without touching experiment RNGs."""
+    if requested is not None and (
+        not requested or Path(requested).name != requested or requested in (".", "..")
+    ):
+        raise ValueError("Run name must be a single directory name")
+    try:
+        runs = trackio.Api().runs(project)
+    except ValueError:
+        # Trackio's public API raises ValueError when the project does not exist.
+        used_names: set[str] = set()
+    else:
+        used_names = {run.name for run in runs}
+    root = Path(output_dir)
+    if root.exists():
+        used_names.update(path.name for path in root.iterdir())
+    number = 0
+    for used_name in used_names:
+        _, separator, suffix = used_name.rpartition("-")
+        if separator and suffix.isdecimal():
+            number = max(number, int(suffix) + 1)
+    adjectives = ("bright", "calm", "clever", "gentle", "lively", "quiet", "swift", "warm")
+    nouns = ("badger", "cedar", "comet", "falcon", "meadow", "otter", "river", "willow")
+    name = requested
+    while (
+        name is None or name in used_names
+        or (root / name).exists() or (root / name).is_symlink()
+    ):
+        letters = "".join(secrets.choice(ascii_lowercase) for _ in range(4))
+        name = (
+            f"{secrets.choice(adjectives)}-{secrets.choice(nouns)}-"
+            f"{letters}-{number}"
+        )
+    return name
+
+
 def run_experiment(model: eqx.Module, data, args):
     """Train, saving the last completed epoch on normal completion or Ctrl-C.
 
     Checkpoints include optimizer state and the exact dataset. Full resume uses
     absolute epoch numbers so training shuffles still use seed + epoch.
     """
+    requested_name = args.name
+    args.name = _choose_run_name(args.project, args.output_dir, requested_name)
+    if requested_name is not None and args.name != requested_name:
+        print(f"Run name {requested_name!r} is already in use; using {args.name!r}.", flush=True)
+    print(f"Run name: {args.name}", flush=True)
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(args.learning_rate),
