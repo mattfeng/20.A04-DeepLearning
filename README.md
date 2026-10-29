@@ -134,7 +134,7 @@ The values above are the defaults. `--channels` takes the output channel count f
 
 ### Addition experiments
 
-`math/` compares a vanilla tanh RNN, a chrono-initialized LSTM, and a decoder-only Transformer, all supporting stacked layers. Data generation, the dataset viewer, training, and the REPL support addition of nonnegative integers only; there is no operation-selection setting.
+`math/` compares a vanilla tanh RNN, a chrono-initialized LSTM, and a decoder-only Transformer on a simple addition completion task (e.g. `123+456=`).
 
 From the repository root:
 
@@ -146,13 +146,11 @@ uv run trackio show
 
 Each prompt is an equation such as `12+7=`. The target completion contains optional `~` thinking tokens followed by `:answer$`, for example `~~:19$`. Equations are balanced by operand digit lengths and split roughly 80/10/10 into training, validation, and test sets before expanding thinking-step variants.
 
-Training runs use the full training split each epoch and log metrics to Trackio. Evaluation reports answer/EOS loss and greedy exact-answer accuracy; intermediate thinking text is not part of the scored answer.
-
 The experiment prompts separately for model, data, and training/run settings. Press Enter to keep the displayed default, or type a replacement. Use `yes`/`no` for booleans, comma-separated integers for thinking steps (for example `0,1,2,4`), and `none` to clear an optional artifact path or run name. Ctrl-D or Ctrl-C cancels configuration before training starts.
 
-Three optional flags supply prompt defaults using space-separated `key=value` pairs, not JSON: `--model-config` for the model, `--data-config` for data generation, and `--experiment-config` for training and run settings. Every applicable setting is still prompted, including supplied values. Quote values containing spaces inside the config string, for example `--experiment-config 'name="my run" epochs=50'`.
+Three optional flags supply prompt defaults using space-separated `key=value` pairs: `--model-config` for the model, `--data-config` for data generation, and `--experiment-config` for training and run settings. Quote values containing spaces inside the config string, for example `--experiment-config 'name="my run" epochs=50'`.
 
-Model options are listed separately below so you can copy the settings for the architecture you are testing. Pass them as `key=value` pairs in `--model-config`, not as individual CLI flags. Only the selected model's settings are prompted. See [Transformer model options](#transformer-model-options) under [Attention and transformers](#attention-and-transformers) for the Transformer.
+Model options are listed separately below so you can copy the settings for the architecture you are testing. See [Transformer model options](#transformer-model-options) under [Attention and transformers](#attention-and-transformers) for the Transformer.
 
 #### RNN model options
 
@@ -226,9 +224,7 @@ These settings apply to RNN, LSTM, and Transformer runs alike. Pass data setting
 | `name` | `none` or a nonempty run name usable as a single directory name (not `.` or `..`) | `none` | Trackio run name and artifact subdirectory; `none` lets Trackio choose. |
 | `output-dir` | Nonempty directory path | `artifacts/math` | Artifact root; the run subdirectory must not already exist. |
 
-In each `key=value` pair, the key is the setting name before `=`. Put model settings such as `hidden-size` in `--model-config`, data settings such as `max-operand` in `--data-config`, and training/run settings such as `epochs` in `--experiment-config`. For example, use `--model-config 'hidden-size=64' --data-config 'max-operand=19 seed=7' --experiment-config 'epochs=50 seed=3'`. Keys in the wrong group are rejected. The two `seed` keys are independent; set both to the same value to reproduce a previous run that used one shared seed. Artifacts record the data seed as `data_seed` and the training/run seed as `seed`.
-
-The dataset viewer accepts the same `--data-config` string as the experiment command, applies it directly without interactive prompts, and uses the same defaults for omitted keys. Data settings are no longer individual CLI flags. Viewer ordering remains a separate `--sort` flag. For example, to inspect equations ordered by operand size:
+The dataset viewer accepts the same `--data-config` string as the experiment command. Additionally, you can control viewer ordering via the `--sort` flag. For example, to inspect equations ordered by operand size:
 
 ```bash
 uv run math/data.py \
@@ -278,13 +274,11 @@ The REPL detects the saved architecture automatically. Enter `12+7` or `3+9=`; s
 | `num-heads` | Integer ≥ `1` that divides `hidden-size` | `4` | Attention heads per block; for width `128`: `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128`. |
 | `feedforward-size` | Integer ≥ `1` | `4 × hidden-size` | Inner width of each block's feedforward network. |
 
+Transformer blocks always use residual connections; there is no `skip-connections` setting for this model.
+
 ```bash
 uv run math/experiment.py \
     --model-config 'model=transformer hidden-size=128 num-layers=1 num-heads=4 feedforward-size=512'
 ```
-
-Transformer blocks always use residual connections; there is no `skip-connections` setting for this model.
-
-As with the recurrent models, this command opens interactive configuration prompts; press Enter to keep each supplied/default value. It uses the same deterministic dataset splits, thinking-step variants, loss, optimizer, greedy completion, and train/validation/test metrics, logged to the same Trackio project. Transformer artifacts support both `init-from` training and the REPL. Decoding recomputes the full sequence for each token, without a key/value cache; attention has quadratic sequence-length cost.
 
 See [shared experiment options](#shared-experiment-options) for data and training/run settings, [training from an artifact](#training-from-an-artifact) for loading saved weights, and [interactive evaluation](#interactive-evaluation) for using the REPL.
