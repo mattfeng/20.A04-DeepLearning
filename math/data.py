@@ -57,25 +57,32 @@ def generate_data(
     completion_length: int = 32, dataset_size: int = 120,
     thinking_steps: tuple[int, ...] = DEFAULT_THINKING_STEPS,
 ) -> ArithmeticData:
-    """Balance operand-length groups for addition, then randomly split 80/10/10.
+    """Guarantee all single-digit additions in training alongside sampled data.
 
-    Operands include zero and max_operand.
+    Always include all 100 ordered additions with operands 0 through 9 in
+    training. Raise max_operand to at least 9 and dataset_size to at least 100
+    to accommodate this table.
     Commuted expressions are distinct prompts and may occur in different splits.
-    Sample dataset_size unique equations without enumerating the full space.
-    Balance (left digits, right digits) quotas within one example,
-    redistributing quota from exhausted groups. Zero has one digit; the longest
-    range ends at max_operand. Sampling within each group is uniform.
+    Sample the remaining unique equations without enumerating the full space.
+    Balance the other (left digits, right digits) groups within one example,
+    redistributing quota from exhausted groups. Sampling within each group is
+    uniform; the longest operand range ends at the effective max_operand.
 
-    Shuffle unique equations with seed, then reserve floor(dataset_size / 10) for
-    each held-out split. Expand each equation into thinking_steps variants only
-    after splitting; these variants do not count against dataset_size.
-    Digit-length balance applies to the combined equations, not individual splits.
-    Metrics describe digit-balanced interpolation, not uniform integer pairs.
-    completion_length must fit the longest thinking prefix, delimiter, answer,
-    and EOS.
+    Shuffle unique equations with seed, then reserve floor(effective dataset_size
+    / 10) for each held-out split. Add any held-out single-digit additions back
+    into training as well, so only the mandatory table may overlap splits.
+    dataset_size counts unique equations across splits, not their combined sizes.
+    Expand each equation into thinking_steps variants only after splitting;
+    variants do not count against dataset_size. Held-out scores on mandatory
+    table equations measure seen examples, not generalization.
+    Digit-length balance excludes the mandatory table and applies to combined
+    equations, not individual splits. Metrics reflect this sampling policy,
+    not uniform integer pairs. completion_length must fit the longest thinking
+    prefix, delimiter, answer, and EOS.
     """
     if max_operand < 1:
         raise ValueError("max_operand must be at least 1")
+    max_operand = max(max_operand, 9)
     thinking_steps = tuple(thinking_steps)
     if (
         not thinking_steps
@@ -88,6 +95,7 @@ def generate_data(
         raise ValueError(
             f"dataset_size must be between 10 and {population_size} unique equations"
         )
+    dataset_size = max(dataset_size, 100)
     rng = random.Random(seed)
     operand_ranges = [
         (0 if digits == 1 else 10 ** (digits - 1), min(max_operand, 10 ** digits - 1))
@@ -99,17 +107,20 @@ def generate_data(
         for b_min, b_max in operand_ranges
     ]
     capacities = [a_count * b_count for _, a_count, _, b_count in groups]
-    # Find the common quota after filling groups too small to reach it.
-    remaining = dataset_size
+    # Fill the single-digit table, then balance quotas across the other groups.
+    remaining = dataset_size - capacities[0]
     quota = 0
-    for index, capacity in enumerate(sorted(capacities)):
-        quota = remaining // (len(groups) - index)
+    for index, capacity in enumerate(sorted(capacities[1:])):
+        quota = remaining // (len(groups) - 1 - index)
         if capacity >= quota:
             break
         remaining -= capacity
-    counts = [min(capacity, quota) for capacity in capacities]
+    counts = [capacities[0]] + [min(capacity, quota) for capacity in capacities[1:]]
     extra = dataset_size - sum(counts)
-    eligible = [index for index, capacity in enumerate(capacities) if capacity > quota]
+    eligible = [
+        index for index, capacity in enumerate(capacities)
+        if index > 0 and capacity > quota
+    ]
     for index in rng.sample(eligible, extra):
         counts[index] += 1
 
@@ -125,9 +136,16 @@ def generate_data(
             f"completion_length must be at least {required_completion} to fit thinking, "
             "the answer delimiter, answer, and EOS"
         )
+    essential = examples[:capacities[0]]
     rng.shuffle(examples)
     shuffled = tuple(examples)
     held_out = dataset_size // 10
+    train_examples = list(shuffled[: -2 * held_out])
+    train_prompts = {example.prompt for example in train_examples}
+    train_examples.extend(
+        example for example in essential if example.prompt not in train_prompts
+    )
+    rng.shuffle(train_examples)
 
     def variants(equations):
         return tuple(
@@ -137,7 +155,7 @@ def generate_data(
         )
 
     return ArithmeticData(
-        train=variants(shuffled[: -2 * held_out]),
+        train=variants(train_examples),
         validation=variants(shuffled[-2 * held_out : -held_out]),
         test=variants(shuffled[-held_out:]),
         sequence_length=(
