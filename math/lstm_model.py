@@ -1,4 +1,4 @@
-"""A stacked LSTM exposing token-sequence -> causal next-token logits."""
+"""A stacked, chrono-initialized LSTM exposing causal next-token logits."""
 
 import json
 import math
@@ -19,21 +19,21 @@ class LSTM(eqx.Module):
     readout: eqx.nn.Linear
     hidden_size: int = eqx.field(static=True)
     embedding_size: int = eqx.field(static=True)
-    forget_bias: float = eqx.field(static=True)
-    chrono_max_timescale: float | None = eqx.field(static=True)
+    chrono_max_timescale: float = eqx.field(static=True)
     num_layers: int = eqx.field(static=True)
     skip_connections: bool = eqx.field(static=True)
 
     def __init__(
         self, vocab_size: int, hidden_size: int = 128, *,
-        embedding_size: int | None = None, forget_bias: float = 1.0,
-        chrono_max_timescale: float | None = None,
+        embedding_size: int | None = None, chrono_max_timescale: float = 32.0,
         num_layers: int = 1, skip_connections: bool = False, key: PRNGKeyArray,
     ):
         if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
             raise ValueError("num_layers must be a positive integer")
-        if chrono_max_timescale is not None and (
-            not math.isfinite(chrono_max_timescale) or chrono_max_timescale < 2
+        if (
+            chrono_max_timescale is None
+            or not math.isfinite(chrono_max_timescale)
+            or chrono_max_timescale < 2
         ):
             raise ValueError("chrono_max_timescale must be finite and at least 2")
         embedding_key, input_key, recurrent_key, output_key = jax.random.split(key, 4)
@@ -41,7 +41,6 @@ class LSTM(eqx.Module):
         self.num_layers = num_layers
         self.skip_connections = skip_connections
         self.embedding_size = hidden_size if embedding_size is None else embedding_size
-        self.forget_bias = forget_bias
         self.chrono_max_timescale = chrono_max_timescale
         self.embedding = eqx.nn.Embedding(vocab_size, self.embedding_size, key=embedding_key)
         input_projections = []
@@ -57,16 +56,14 @@ class LSTM(eqx.Module):
             recurrent_projections.append(eqx.nn.Linear(
                 hidden_size, 4 * hidden_size, use_bias=False, key=recurrent_key,
             ))
-            # Gate order: input, forget, candidate, output. Only forget biases
-            # get this initializer; all biases remain trainable.
-            layer_forget_bias = forget_bias
-            if chrono_max_timescale is not None:
-                bias_key = jax.random.fold_in(layer_key, 4)
-                layer_forget_bias = jnp.log(jax.random.uniform(
-                    bias_key, (hidden_size,), dtype=input_projection.bias.dtype,
-                    minval=1.0, maxval=chrono_max_timescale - 1.0,
-                ))
-            bias = input_projection.bias.at[hidden_size:2 * hidden_size].set(layer_forget_bias)
+            # Gate order: input, forget, candidate, output. Chrono initialization
+            # sets forget biases to log(U[1, T_max - 1)); all biases remain trainable.
+            bias_key = jax.random.fold_in(layer_key, 4)
+            chrono_bias = jnp.log(jax.random.uniform(
+                bias_key, (hidden_size,), dtype=input_projection.bias.dtype,
+                minval=1.0, maxval=chrono_max_timescale - 1.0,
+            ))
+            bias = input_projection.bias.at[hidden_size:2 * hidden_size].set(chrono_bias)
             input_projections.append(eqx.tree_at(
                 lambda projection: projection.bias, input_projection, bias,
             ))
@@ -89,7 +86,6 @@ class LSTM(eqx.Module):
                 "num_layers": self.num_layers,
                 "skip_connections": self.skip_connections,
                 "embedding_size": self.embedding_size,
-                "forget_bias": self.forget_bias,
                 "chrono_max_timescale": self.chrono_max_timescale,
             },
             "vocab": VOCAB,
@@ -107,8 +103,17 @@ class LSTM(eqx.Module):
             raise ValueError("Artifact vocabulary does not match the current vocabulary")
         if config["architecture"] != cls.__name__:
             raise ValueError("Artifact architecture does not match this model")
+        # Reconstruct only current settings. Historical initialization metadata
+        # does not affect the stored weights, which are restored unchanged.
+        model_config = {
+            name: value for name, value in config["model_config"].items()
+            if name in (
+                "hidden_size", "embedding_size", "num_layers",
+                "skip_connections", "chrono_max_timescale",
+            ) and value is not None
+        }
         model = eqx.filter_eval_shape(
-            cls, len(VOCAB), **config["model_config"], key=jax.random.key(0),
+            cls, len(VOCAB), **model_config, key=jax.random.key(0),
         )
         return eqx.tree_deserialise_leaves(directory / "model.eqx", model), config
 

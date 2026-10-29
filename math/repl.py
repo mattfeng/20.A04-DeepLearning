@@ -1,4 +1,4 @@
-"""Interactively evaluate a saved arithmetic model using the experiment's scoring."""
+"""Interactively evaluate a saved addition model using the experiment's scoring."""
 
 import argparse
 import json
@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 
-HELP = "Enter a+b, a-b, or a*b (optional =). :help for help; :quit or Ctrl-D to exit."
+HELP = "Enter a+b (optional =). :help for help; :quit or Ctrl-D to exit."
 
 
 def read_equations():
@@ -20,17 +20,17 @@ def read_equations():
         if text == ":help":
             print(HELP)
             continue
-        match = re.fullmatch(r"([0-9]+)\s*([+*-])\s*([0-9]+)\s*=?", text)
+        match = re.fullmatch(r"([0-9]+)\s*\+\s*([0-9]+)\s*=?", text)
         if match is None:
-            print("Use two nonnegative integer operands and one of +, -, *; e.g. 12+7=.")
+            print("Use two nonnegative integer operands joined by +; e.g. 12+7=.")
             continue
-        left, operation, right = match.groups()
+        left, right = match.groups()
         try:
             left, right = int(left), int(right)
         except ValueError as error:
             print(f"Invalid operand: {error}")
             continue
-        yield f"{left}{operation}{right}=", left, operation, right
+        yield f"{left}+{right}=", left, right
 
 
 def predict(model, config, prompt: str) -> str:
@@ -56,14 +56,16 @@ def main():
     parser.add_argument("artifact", help="Run directory containing model.eqx and config.json")
     args = parser.parse_args()
 
-    from data import OPERATIONS
     from experiment import extract_answer
     from lstm_model import LSTM
     from rnn_model import RNN
+    from transformer_model import Transformer
 
     try:
         config = json.loads((Path(args.artifact) / "config.json").read_text())
-        model_class = {"RNN": RNN, "LSTM": LSTM}.get(config["architecture"])
+        model_class = {
+            "RNN": RNN, "LSTM": LSTM, "Transformer": Transformer,
+        }.get(config["architecture"])
         if model_class is None:
             raise ValueError(f"Unsupported artifact architecture: {config['architecture']}")
         model, config = model_class.load_artifact(args.artifact)
@@ -72,8 +74,8 @@ def main():
     print(f"Loaded {args.artifact}")
     print(HELP)
     try:
-        for prompt, left, operation, right in read_equations():
-            expected = str(OPERATIONS[operation](left, right))
+        for prompt, left, right in read_equations():
+            expected = str(left + right)
             completion = predict(model, config, prompt)
             answer = extract_answer(completion)
             body, eos, _ = completion.partition("$")

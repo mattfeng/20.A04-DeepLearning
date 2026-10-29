@@ -1,18 +1,26 @@
-"""Deterministic character-level arithmetic; no training or I/O on import."""
+"""Deterministic character-level addition; no training or I/O on import."""
 
 from dataclasses import dataclass
-import operator
 import random
 
 import numpy as np
 from jaxtyping import Bool, Int
 
+from config import parse_config, thinking_steps
 
+
+# Retain historical token IDs and checkpoint shapes; only addition is supported.
 VOCAB = "_0123456789+-*=$~:"
 PAD_ID = VOCAB.index("_")
 EOS_ID = VOCAB.index("$")
-OPERATIONS = {"+": operator.add, "-": operator.sub, "*": operator.mul}
 DEFAULT_THINKING_STEPS = (0, 1, 2, 4, 8, 16)
+DATA_DEFAULTS = {
+    "max_operand": 19,
+    "dataset_size": 120,
+    "completion_length": 32,
+    "thinking_steps": DEFAULT_THINKING_STEPS,
+    "seed": 0,
+}
 
 
 def encode(text: str) -> Int[np.ndarray, "tokens"]:
@@ -45,16 +53,16 @@ class ArithmeticData:
 
 
 def generate_data(
-    *, max_operand: int = 19, operations: str = "+-*", seed: int = 0,
+    *, max_operand: int = 19, seed: int = 0,
     completion_length: int = 32, dataset_size: int = 120,
     thinking_steps: tuple[int, ...] = DEFAULT_THINKING_STEPS,
 ) -> ArithmeticData:
-    """Balance operator/operand-length groups, then randomly split 80/10/10.
+    """Balance operand-length groups for addition, then randomly split 80/10/10.
 
-    Operands include zero and max_operand. Subtraction may be negative.
+    Operands include zero and max_operand.
     Commuted expressions are distinct prompts and may occur in different splits.
     Sample dataset_size unique equations without enumerating the full space.
-    Balance (operator, left digits, right digits) quotas within one example,
+    Balance (left digits, right digits) quotas within one example,
     redistributing quota from exhausted groups. Zero has one digit; the longest
     range ends at max_operand. Sampling within each group is uniform.
 
@@ -68,10 +76,6 @@ def generate_data(
     """
     if max_operand < 1:
         raise ValueError("max_operand must be at least 1")
-    if not operations or len(set(operations)) != len(operations):
-        raise ValueError("operations must be nonempty and contain no duplicates")
-    if any(op not in OPERATIONS for op in operations):
-        raise ValueError("supported operations are +, -, and *")
     thinking_steps = tuple(thinking_steps)
     if (
         not thinking_steps
@@ -79,9 +83,7 @@ def generate_data(
         or any(left >= right for left, right in zip(thinking_steps, thinking_steps[1:]))
     ):
         raise ValueError("thinking_steps must be nonempty, nonnegative, and strictly increasing")
-    operand_count = max_operand + 1
-    pairs_per_operation = operand_count ** 2
-    population_size = len(operations) * pairs_per_operation
+    population_size = (max_operand + 1) ** 2
     if not 10 <= dataset_size <= population_size:
         raise ValueError(
             f"dataset_size must be between 10 and {population_size} unique equations"
@@ -92,12 +94,11 @@ def generate_data(
         for digits in range(1, len(str(max_operand)) + 1)
     ]
     groups = [
-        (op, a_min, a_max - a_min + 1, b_min, b_max - b_min + 1)
-        for op in operations
+        (a_min, a_max - a_min + 1, b_min, b_max - b_min + 1)
         for a_min, a_max in operand_ranges
         for b_min, b_max in operand_ranges
     ]
-    capacities = [a_count * b_count for _, _, a_count, _, b_count in groups]
+    capacities = [a_count * b_count for _, a_count, _, b_count in groups]
     # Find the common quota after filling groups too small to reach it.
     remaining = dataset_size
     quota = 0
@@ -113,11 +114,11 @@ def generate_data(
         counts[index] += 1
 
     examples = []
-    for (op, a_min, a_count, b_min, b_count), count in zip(groups, counts):
+    for (a_min, a_count, b_min, b_count), count in zip(groups, counts):
         for index in rng.sample(range(a_count * b_count), count):
             a_offset, b_offset = divmod(index, b_count)
             a, b = a_min + a_offset, b_min + b_offset
-            examples.append(Example(f"{a}{op}{b}=", str(OPERATIONS[op](a, b))))
+            examples.append(Example(f"{a}+{b}=", str(a + b)))
     required_completion = thinking_steps[-1] + max(len(e.completion) for e in examples)
     if completion_length < required_completion:
         raise ValueError(
@@ -173,29 +174,29 @@ if __name__ == "__main__":
     import argparse
     import pydoc
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-operand", type=int, default=19)
-    parser.add_argument("--operations", default="+-*")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--dataset-size", type=int, default=120)
-    parser.add_argument("--completion-length", type=int, default=32)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
-        "--thinking-steps", type=int, nargs="+", default=DEFAULT_THINKING_STEPS,
-        help="Increasing counts of ~ tokens per equation; variants do not count toward dataset-size",
+        "--data-config", metavar="'KEY=VALUE ...'",
+        help="Data settings, e.g. 'max-operand=19 dataset-size=120 thinking-steps=0,1,2,4 seed=0'",
     )
     parser.add_argument(
         "--sort", choices=("dataset", "equation", "operand-size"), default="dataset",
-        help="Viewer order within each split: sampled order, left/operator/right, or max/min operand",
+        help="Viewer order within each split: sampled order, left/right, or max/min operand",
     )
-    options = vars(parser.parse_args())
-    sort_order = options.pop("sort")
-    data = generate_data(**options)
-    operator_order = {op: index for index, op in enumerate(OPERATIONS)}
+    args = parser.parse_args()
+    sort_order = args.sort
+    try:
+        overrides = parse_config(args.data_config, DATA_DEFAULTS, "--data-config")
+        options = dict(DATA_DEFAULTS)
+        for key, value in overrides.items():
+            options[key] = thinking_steps(value) if key == "thinking_steps" else int(value)
+        data = generate_data(**options)
+    except ValueError as error:
+        parser.error(str(error))
 
     def sort_key(example):
-        op = next(op for op in OPERATIONS if op in example.prompt)
-        left, right = map(int, example.prompt[:-1].split(op))
-        equation = (left, operator_order[op], right)
+        left, right = map(int, example.prompt[:-1].split("+"))
+        equation = (left, right)
         if sort_order == "operand-size":
             return (max(left, right), min(left, right), *equation)
         return equation

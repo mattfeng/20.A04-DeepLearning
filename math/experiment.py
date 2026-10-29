@@ -1,11 +1,10 @@
-"""Train and compare sequence models on a fixed arithmetic completion task."""
+"""Train and compare sequence models on a fixed addition completion task."""
 
 import argparse
 from collections.abc import Callable
 import json
 import math
 from pathlib import Path
-import shlex
 from typing import Any
 
 import einops
@@ -19,12 +18,14 @@ import trackio
 from jaxtyping import Array, Bool, Float, Int
 from tqdm import tqdm
 
+from config import parse_config, thinking_steps
 from data import (
-    DEFAULT_THINKING_STEPS, EOS_ID, OPERATIONS, PAD_ID, VOCAB, Example, decode, encode,
+    DATA_DEFAULTS, EOS_ID, PAD_ID, VOCAB, Example, decode, encode,
     encode_example, generate_data,
 )
 from lstm_model import LSTM
 from rnn_model import RNN
+from transformer_model import Transformer
 
 
 def batches(examples, sequence_length, batch_size, *, shuffle_seed=None):
@@ -141,8 +142,7 @@ def _exact_accuracy(model, examples, data, batch_size):
             completion = "".join(VOCAB[int(token)] for token in prediction[len(example.prompt):])
             is_correct = extract_answer(completion) == example.answer
             correct += is_correct
-            op = next(op for op in OPERATIONS if op in example.prompt)
-            left, right = example.prompt[:-1].split(op)
+            left, right = example.prompt[:-1].split("+")
             group = (len(left), len(right))
             group_correct, group_total = group_counts.get(group, (0, 0))
             group_counts[group] = (group_correct + is_correct, group_total + 1)
@@ -274,16 +274,6 @@ def run_experiment(model: eqx.Module, data, args):
     return model
 
 
-def _thinking_steps(text: str) -> list[int]:
-    steps = [int(step) for step in text.split(",")]
-    if (
-        any(step < 0 for step in steps)
-        or any(left >= right for left, right in zip(steps, steps[1:]))
-    ):
-        raise ValueError("use comma-separated increasing nonnegative integers, e.g. 0,1,2,4")
-    return steps
-
-
 def _prompt(
     option, default, convert: Callable[[str], Any] = str, *,
     optional=False, minimum=None, positive=False, choices=(),
@@ -335,8 +325,12 @@ def parse_args():
         help="Model prompt defaults, e.g. 'model=lstm hidden-size=128 num-layers=3'",
     )
     parser.add_argument(
+        "--data-config", metavar="'KEY=VALUE ...'",
+        help="Data prompt defaults, e.g. 'max-operand=19 dataset-size=120 seed=0'",
+    )
+    parser.add_argument(
         "--experiment-config", metavar="'KEY=VALUE ...'",
-        help="Data/training/run prompt defaults, e.g. 'operations=+ epochs=50 seed=0'",
+        help="Training/run prompt defaults, e.g. 'epochs=50 seed=0'",
     )
     cli = parser.parse_args()
     model_defaults = {
@@ -346,15 +340,11 @@ def parse_args():
         "num_layers": 1,
         "skip_connections": False,
         "embedding_size": None,
-        "forget_bias": 1.0,
-        "chrono_max_timescale": None,
+        "chrono_max_timescale": 32.0,
+        "num_heads": 4,
+        "feedforward_size": None,
     }
     experiment_defaults = {
-        "max_operand": 19,
-        "operations": "+-*",
-        "dataset_size": 120,
-        "completion_length": 32,
-        "thinking_steps": DEFAULT_THINKING_STEPS,
         "batch_size": 64,
         "epochs": 100,
         "learning_rate": 1e-3,
@@ -366,34 +356,21 @@ def parse_args():
         "output_dir": "artifacts/math",
     }
 
-    def configure(flag, options):
-        config = {}
-        text = getattr(cli, flag)
-        if text is not None:
-            try:
-                entries = shlex.split(text)
-            except ValueError as error:
-                parser.error(f"could not read --{flag.replace('_', '-')}: {error}")
-            for entry in entries:
-                key, separator, value = entry.partition("=")
-                option = key.replace("-", "_")
-                if not separator or option not in options:
-                    parser.error(
-                        f"expected a known key=value option for --{flag.replace('_', '-')}, "
-                        f"got {entry!r}"
-                    )
-                config[option] = value
-            options.update(config)
-        return config
-
-    model_config = configure("model_config", model_defaults)
-    configure("experiment_config", experiment_defaults)
-    if all(
-        model_config.get(option, "none").lower() != "none"
-        for option in ("forget_bias", "chrono_max_timescale")
-    ):
-        parser.error("forget-bias and chrono-max-timescale are mutually exclusive")
-    defaults = {**model_defaults, **experiment_defaults}
+    try:
+        model_config = parse_config(cli.model_config, model_defaults, "--model-config")
+        data_config = parse_config(cli.data_config, DATA_DEFAULTS, "--data-config")
+        experiment_config = parse_config(
+            cli.experiment_config, experiment_defaults, "--experiment-config",
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    data_defaults = {**DATA_DEFAULTS, **data_config}
+    data_defaults["data_seed"] = data_defaults.pop("seed")
+    defaults = {
+        **model_defaults, **model_config,
+        **data_defaults,
+        **experiment_defaults, **experiment_config,
+    }
     args = argparse.Namespace()
 
     def ask(option, convert: Callable[[str], Any] = str, **kwargs):
@@ -408,7 +385,8 @@ def parse_args():
         if args.init_from is not None:
             architecture_options = {
                 "model", "hidden_size", "num_layers", "skip_connections",
-                "embedding_size", "forget_bias", "chrono_max_timescale",
+                "embedding_size", "chrono_max_timescale",
+                "num_heads", "feedforward_size",
             }
             overrides = architecture_options & model_config.keys()
             if overrides:
@@ -418,25 +396,31 @@ def parse_args():
                 )
             print("Using the saved architecture; only data and training settings are editable.")
         else:
-            ask("model", choices=("rnn", "lstm"))
+            ask("model", choices=("rnn", "lstm", "transformer"))
             ask("hidden_size", int, minimum=1)
             ask("num_layers", int, minimum=1)
-            ask("skip_connections", bool)
+            if args.model == "transformer":
+                while True:
+                    ask("num_heads", int, minimum=1)
+                    if args.hidden_size % args.num_heads == 0:
+                        break
+                    print("Invalid num_heads: must divide hidden_size. Please try again.")
+                if defaults["feedforward_size"] is None:
+                    defaults["feedforward_size"] = 4 * args.hidden_size
+                ask("feedforward_size", int, minimum=1)
+            else:
+                ask("skip_connections", bool)
             if args.model == "lstm":
                 if defaults["embedding_size"] is None:
                     defaults["embedding_size"] = args.hidden_size
                 ask("embedding_size", int, minimum=1)
-                ask("chrono_max_timescale", float, optional=True, minimum=2)
-                if args.chrono_max_timescale is None:
-                    ask("forget_bias", float)
-                else:
-                    args.forget_bias = 1.0
+                ask("chrono_max_timescale", float, minimum=2)
         print("\nData configuration")
         ask("max_operand", int, minimum=1)
-        ask("operations")
         ask("dataset_size", int, minimum=10)
         ask("completion_length", int, minimum=1)
-        ask("thinking_steps", _thinking_steps)
+        ask("thinking_steps", thinking_steps)
+        ask("data_seed", int)
         print("\nTraining and run configuration")
         ask("batch_size", int, minimum=1)
         ask("epochs", int, minimum=1)
@@ -458,30 +442,42 @@ def create_model(args):
         args.init_from = str(Path(args.init_from).expanduser().resolve())
         try:
             saved_config = json.loads((Path(args.init_from) / "config.json").read_text())
-            model_class = {"RNN": RNN, "LSTM": LSTM}.get(saved_config["architecture"])
+            model_class = {
+                "RNN": RNN, "LSTM": LSTM, "Transformer": Transformer,
+            }.get(saved_config["architecture"])
             if model_class is None:
                 raise ValueError(f"Unsupported artifact architecture: {saved_config['architecture']}")
             model, _ = model_class.load_artifact(args.init_from)
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise SystemExit(f"Could not load initial weights: {error}") from error
         args.model = type(model).__name__.lower()
-        for option in ("hidden_size", "num_layers", "skip_connections"):
+        for option in ("hidden_size", "num_layers"):
             setattr(args, option, getattr(model, option))
+        if args.model == "transformer":
+            for option in ("num_heads", "feedforward_size"):
+                setattr(args, option, getattr(model, option))
+        else:
+            args.skip_connections = model.skip_connections
         if args.model == "lstm":
-            for option in ("embedding_size", "forget_bias", "chrono_max_timescale"):
+            for option in ("embedding_size", "chrono_max_timescale"):
                 setattr(args, option, getattr(model, option))
         print(f"Loaded initial weights from {args.init_from}", flush=True)
     else:
         model_options = {
             "hidden_size": args.hidden_size, "num_layers": args.num_layers,
-            "skip_connections": args.skip_connections,
         }
+        if args.model == "transformer":
+            model_options.update(
+                num_heads=args.num_heads, feedforward_size=args.feedforward_size,
+            )
+        else:
+            model_options["skip_connections"] = args.skip_connections
         if args.model == "lstm":
             model_options.update(
-                embedding_size=args.embedding_size, forget_bias=args.forget_bias,
+                embedding_size=args.embedding_size,
                 chrono_max_timescale=args.chrono_max_timescale,
             )
-        model_class = {"rnn": RNN, "lstm": LSTM}[args.model]
+        model_class = {"rnn": RNN, "lstm": LSTM, "transformer": Transformer}[args.model]
         model = model_class(len(VOCAB), **model_options, key=jax.random.key(args.seed))
     return model
 
@@ -490,7 +486,7 @@ def main():
     args = parse_args()
     model = create_model(args)
     data = generate_data(
-        max_operand=args.max_operand, operations=args.operations, seed=args.seed,
+        max_operand=args.max_operand, seed=args.data_seed,
         completion_length=args.completion_length,
         dataset_size=args.dataset_size,
         thinking_steps=args.thinking_steps,
