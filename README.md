@@ -305,3 +305,14 @@ uv run math/experiment.py \
 ```
 
 See [shared experiment options](#shared-experiment-options) for data and training/run settings, [training from an artifact](#training-from-an-artifact) for loading saved weights, and [interactive evaluation](#interactive-evaluation) for using the REPL.
+
+
+## Flow matching
+
+- How I understand flow matching (Jia-Bin Huang): https://www.youtube.com/watch?v=DDq_pIfHqLs
+
+
+## Miscellaneous
+
+- [Neural circuit diagrams (Vincent Abbott)](https://arxiv.org/abs/2402.05424)
+    - Quick introduction: https://vtabbott.io/articles/diagrams-explained-quickly/
