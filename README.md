@@ -244,24 +244,6 @@ uv run math/experiment.py \
     --experiment-config 'resume=no epochs=50 learning-rate=0.0001 name=continued-run'
 ```
 
-#### Interrupting and resuming training
-
-Press Ctrl-C once during training to save the last fully completed training epoch. Updates from an unfinished epoch are discarded; if no epoch has finished, the initial state is saved as epoch `0`. Interruption during the per-epoch metrics also saves that epoch's completed training updates. The artifact path is printed before exit, Trackio is closed, and test evaluation is skipped for interrupted runs. This handles Ctrl-C, not forced termination such as `kill -9`.
-
-Both completed and interrupted runs save `model.eqx`, `config.json`, `optimizer.eqx`, and `data.json`. The checkpoint includes Adam's moments and step counter, the exact ordered train/validation/test examples and thinking variants, data settings, training settings, and `completed_epoch`. It remains usable by the REPL and weights-only `init-from` training.
-
-To restore the full training state, set `resume=yes` alongside `init-from`:
-
-```bash
-uv run math/experiment.py \
-    --model-config 'init-from=artifacts/math/interrupted-run' \
-    --experiment-config 'resume=yes epochs=100 name=resumed-run'
-```
-
-Full resume restores the dataset directly from `data.json`, rather than regenerating or resplitting it, and restores the optimizer using the saved learning rate, regularization settings, batch size, and training seed. Training continues at `completed_epoch + 1`, using the original epoch-based shuffle schedule. For example, a checkpoint at epoch `12` with `epochs=100` runs epochs `13` through `100`. The prompted epoch default is the original target, or the next epoch if that target has already been reached.
-
-When `resume=yes`, omit `--data-config` and do not supply `batch-size`, `learning-rate`, `weight-decay`, `weight-decay-type`, or `seed` in `--experiment-config`; these settings are restored and are not prompted. You can change the target `epochs`, Trackio `project`, new run `name`, and `output-dir`. A resumed run writes a new artifact directory and does not overwrite its source checkpoint. Older artifacts without optimizer and dataset files support weights-only loading with `resume=no`, but not full resume.
-
 #### Interactive evaluation
 
 Try a saved model interactively (use the run path printed after training):
@@ -272,7 +254,6 @@ uv run math/repl.py artifacts/math/your-trackio-run-name
 
 The REPL detects the saved architecture automatically. Enter `12+7` or `3+9=`; spaces and a trailing `=` are optional. Subtraction, multiplication, and negative operands are rejected. The REPL shows the raw completion, extracted answer, expected answer, and exact-match result. `:help` shows input syntax; `:quit`, Ctrl-D, or Ctrl-C exits.
 
-
 ## Attention and transformers
 
 - 3Blue1Brown
@@ -282,9 +263,13 @@ The REPL detects the saved architecture automatically. Enter `12+7` or `3+9=`; s
 - Sebastian Raschka
     - Coding Self-Attention From Scratch: https://sebastianraschka.com/blog/2023/self-attention-from-scratch.html
 
+### Attention
+
+![](./assets/attention.png)
+
 ### Addition Transformer experiment
 
-`math/transformer_model.py` implements a small decoder-only Transformer with scaled token embeddings, sinusoidal positional encodings, pre-normalized causal multi-head self-attention, GELU feedforward layers, residual connections, and a final normalization/readout. There is no dropout or fixed positional length cap. Causal masking prevents future tokens (including right padding) from influencing earlier predictions; the existing supervision masks remain unchanged.
+`math/transformer_model.py` implements a small decoder-only Transformer with scaled token embeddings, sinusoidal positional encodings, pre-normalized causal multi-head self-attention, GELU feedforward layers, residual connections, and a final normalization/readout. There is no dropout or fixed positional length cap. Causal masking prevents future tokens (including right padding) from influencing earlier predictions.
 
 #### Transformer model options
 
@@ -310,7 +295,6 @@ See [shared experiment options](#shared-experiment-options) for data and trainin
 ## Flow matching
 
 - How I understand flow matching (Jia-Bin Huang): https://www.youtube.com/watch?v=DDq_pIfHqLs
-
 
 ## Miscellaneous
 
