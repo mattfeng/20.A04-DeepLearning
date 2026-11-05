@@ -99,6 +99,8 @@
 
 ## Attention and transformers
 
+### Background
+
 - 3Blue1Brown
     - DL5 — Transformers: https://www.youtube.com/watch?v=wjZofJX0v4M
     - DL6 — Attention in transformers: https://www.youtube.com/watch?v=eMlx5fFNoYc
@@ -106,7 +108,7 @@
 - Sebastian Raschka
     - Coding Self-Attention From Scratch: https://sebastianraschka.com/blog/2023/self-attention-from-scratch.html
 
-### Attention
+### A detailed diagram of attention
 
 ![](./assets/attention.png)
 
